@@ -1,0 +1,28 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Web Cache Deception Scanner
+
+This Burp Suite extension scans web applications for Web Cache Deception vulnerabilities. The main entry point is [src/main/java/burp/BurpExtender.java](mdc:src/main/java/burp/BurpExtender.java), which initializes the extension and registers the context menu.
+
+## What is Web Cache Deception?
+
+Web Cache Deception is a vulnerability where an attacker can trick a web cache into storing sensitive user information by manipulating URL paths. This occurs when:
+
+1. The backend server ignores trailing path segments (e.g., `/account` and `/account/random.css` return the same content)
+2. The caching layer determines cacheability based on file extensions or URL patterns
+
+## Key Components
+
+- [BurpExtender.java](mdc:src/main/java/burp/BurpExtender.java): Main extension class that initializes the scanner and handles the Burp Suite integration
+- [RequestSender.java](mdc:src/main/java/burp/RequestSender.java): Contains the core scanning logic for detecting web cache deception vulnerabilities
+- [WebCacheIssue.java](mdc:src/main/java/burp/WebCacheIssue.java): Defines how vulnerabilities are reported in Burp Suite
+
+## How to Use
+
+1. Build the extension using `./gradlew clean build`
+2. Load the extension in Burp Suite
+3. Right-click on a request in the Site Map or HTTP History and select "Web Cache Deception Test"
+4. Check the extension output tab for detailed scan results

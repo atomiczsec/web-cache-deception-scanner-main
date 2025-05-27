@@ -1,0 +1,31 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Burp Extension Architecture
+
+This extension follows the Burp Suite extension architecture and implements several key interfaces defined in the Burp Suite API.
+
+## Main Extension Class
+
+- [BurpExtender.java](mdc:src/main/java/burp/BurpExtender.java): Implements `IBurpExtender` and `IContextMenuFactory`
+- The `registerExtenderCallbacks` method initializes the extension
+- The `createMenuItems` method adds the "Web Cache Deception Test" context menu option
+
+## Request Handling
+
+- [RequestSender.java](mdc:src/main/java/burp/RequestSender.java): Contains utility methods for sending HTTP requests and analyzing responses
+- Uses Burp's `makeHttpRequest` method to send requests through the Burp proxy
+- Includes sophisticated response analysis with text similarity algorithms
+
+## Issue Reporting
+
+- [WebCacheIssue.java](mdc:src/main/java/burp/WebCacheIssue.java): Implements the `IScanIssue` interface
+- Defines how vulnerabilities appear in Burp's Scanner results tab
+- Provides detailed vulnerability descriptions and remediation advice
+
+## Extension Configuration
+
+- The build configuration is in [build.gradle](mdc:build.gradle)
+- Uses the shadow plugin to build a fat JAR with all dependencies

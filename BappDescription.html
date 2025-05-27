@@ -1,0 +1,37 @@
+<p>
+  <b>Web Cache Deception Scanner</b> is a Burp Suite extension that automatically detects Web Cache Deception (WCD) vulnerabilities in web applications.
+</p>
+
+<p>
+  This extension adds a dedicated Active Scanner check and a context menu option for targeted manual testing.
+</p>
+
+<p>
+  <b>About Web Cache Deception</b>
+</p>
+
+<p>
+  Web Cache Deception is a critical vulnerability first described by security researcher Omer Gil in 2017. It exploits misconfigurations in web caching systems, allowing attackers to trick caches into storing and serving sensitive, user-specific content as if it were public static resources. This can lead to the exposure of private data, authentication tokens, or other confidential information to unauthorized users.<br>
+  <a href="https://omergil.blogspot.co.il/2017/02/web-cache-deception-attack.html" target="_blank">Read Omer Gil's original write-up</a>
+</p>
+
+<ul>
+  <li>
+    The attacker crafts a URL that appends a fake static file extension (e.g., <code>/profile/secret.jpg</code>) to a sensitive endpoint.
+  </li>
+  <li>
+    The victim, while authenticated, visits this URL, causing the cache to store the sensitive content under the deceptive path.
+  </li>
+  <li>
+    The attacker then accesses the same URL and receives the cached sensitive data.
+  </li>
+</ul>
+
+<p>
+  <b>Impact</b>: Successful exploitation can result in theft of personal information, authentication tokens, CSRF tokens, account data, or even enable further attacks such as Cross-Site Request Forgery or account takeover.<br>
+  <a href="https://www.invicti.com/web-vulnerability-scanner/vulnerabilities/web-cache-deception/" target="_blank">Learn more about WCD impacts</a>
+</p>
+
+<p>
+  <b>Mitigation</b>: Ensure cache servers respect application <code>Cache-Control</code> headers, and avoid caching decisions based solely on URL patterns or file extensions. Sensitive resources should never be cached as public content.
+</p>
