@@ -43,8 +43,11 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory {
     }
 
     private void runScannerForRequest(IHttpRequestResponse iHttpRequestResponse) {
-        ExecutorService service = Executors.newFixedThreadPool(4);
-        service.execute(new ScannerThread(iHttpRequestResponse));
+        // Using a new thread avoids leaking ExecutorService threads for each
+        // menu invocation. Previously a new fixed thread pool was created per
+        // request without being shutdown which exhausted resources over time.
+        Thread t = new Thread(new ScannerThread(iHttpRequestResponse));
+        t.start();
     }
 
     @Override
