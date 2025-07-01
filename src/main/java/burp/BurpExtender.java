@@ -11,12 +11,13 @@ import java.util.concurrent.*;
  * @author J Snyman
  * @author T Secker
  */
-public class BurpExtender implements IBurpExtender, IContextMenuFactory {
+public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtensionStateListener {
 
     private final static float VERSION = 1.4f;
 
     private static IBurpExtenderCallbacks callbacks;
     private static IExtensionHelpers helpers;
+    private static ExecutorService executor;
 
     protected static IExtensionHelpers getHelpers() {
         return helpers;
@@ -35,19 +36,26 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory {
         callbacks = iBurpExtenderCallbacks;
         callbacks.setExtensionName("Web Cache Deception Scanner");
         callbacks.registerContextMenuFactory(this);
+        callbacks.registerExtensionStateListener(this);
         callbacks.printOutput("Web Cache Deception Scanner Version " + VERSION);
         callbacks.printOutput("Original Author: Johan Snyman <jsnyman@trustwave.com>");
         callbacks.printOutput("Updated for Burp Community Edition by: atomiczsec <gavin@atomiczsec.net>");
 
         helpers = iBurpExtenderCallbacks.getHelpers();
+
+        int threads = Math.max(2, Runtime.getRuntime().availableProcessors());
+        executor = Executors.newFixedThreadPool(threads);
     }
 
+    // Submit the scanning job to a shared thread pool so multiple requests can
+    // be processed concurrently without spawning excessive threads.
     private void runScannerForRequest(IHttpRequestResponse iHttpRequestResponse) {
-        // Using a new thread avoids leaking ExecutorService threads for each
-        // menu invocation. Previously a new fixed thread pool was created per
-        // request without being shutdown which exhausted resources over time.
-        Thread t = new Thread(new ScannerThread(iHttpRequestResponse));
-        t.start();
+        if (executor != null && !executor.isShutdown()) {
+            executor.submit(new ScannerThread(iHttpRequestResponse));
+        } else {
+            // Fallback if executor is not available
+            new Thread(new ScannerThread(iHttpRequestResponse)).start();
+        }
     }
 
     @Override
@@ -437,6 +445,13 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory {
             } else {
                 return path.substring(lastSlash + 1);
             }
+        }
+    }
+
+    @Override
+    public void extensionUnloaded() {
+        if (executor != null && !executor.isShutdown()) {
+            executor.shutdownNow();
         }
     }
 }
