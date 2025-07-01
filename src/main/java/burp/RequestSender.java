@@ -13,11 +13,15 @@ import java.util.regex.Pattern;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Arrays;
+import java.util.concurrent.ConcurrentHashMap;
 
 class RequestSender {
 
     private final static double   JARO_THRESHOLD = 0.8;
     private final static int      LEVENSHTEIN_THRESHOLD = 200;
+
+    // Simple in-memory cache to avoid repeating identical requests
+    private static final Map<String, Map<String, Object>> RESPONSE_CACHE = new ConcurrentHashMap<>();
 
     // Expanded list of potential cache targets
     protected final static String[] KNOWN_CACHEABLE_PATHS = {
@@ -417,6 +421,15 @@ class RequestSender {
      */
     private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request) {
         try {
+            String cacheKey = service.toString() + Arrays.hashCode(request);
+            Map<String, Object> cached = RESPONSE_CACHE.get(cacheKey);
+            if (cached != null) {
+                return cached;
+            }
+
+            // Small delay to avoid overwhelming the target when running multiple threads
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+
             IHttpRequestResponse response = BurpExtender.getCallbacks().makeHttpRequest(service, request);
             if (response == null) {
                 return null;
@@ -426,11 +439,12 @@ class RequestSender {
             Map<String, Object> details = new HashMap<>();
             details.put("statusCode", (int) responseInfo.getStatusCode());
             details.put("headers", responseInfo.getHeaders());
-            
-            byte[] responseBody = java.util.Arrays.copyOfRange(response.getResponse(), 
+
+            byte[] responseBody = java.util.Arrays.copyOfRange(response.getResponse(),
                 responseInfo.getBodyOffset(), response.getResponse().length);
             details.put("body", responseBody);
-            
+
+            RESPONSE_CACHE.put(cacheKey, details);
             return details;
         } catch (Exception e) {
             BurpExtender.print("Error making HTTP request: " + e.getMessage());
