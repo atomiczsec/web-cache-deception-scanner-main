@@ -14,14 +14,24 @@ import java.util.Map;
 import java.util.HashMap;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.LinkedHashMap;
 
 class RequestSender {
 
     private final static double   JARO_THRESHOLD = 0.8;
     private final static int      LEVENSHTEIN_THRESHOLD = 200;
+    private final static int      CACHE_MAX_SIZE = 1000; // Maximum cache entries
 
-    // Simple in-memory cache to avoid repeating identical requests
-    private static final Map<String, Map<String, Object>> RESPONSE_CACHE = new ConcurrentHashMap<>();
+    // Thread-safe bounded cache with LRU eviction to prevent memory leaks
+    private static final Map<String, Map<String, Object>> RESPONSE_CACHE = new LinkedHashMap<String, Map<String, Object>>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Map<String, Object>> eldest) {
+            return size() > CACHE_MAX_SIZE;
+        }
+    };
+    
+    // Synchronize cache access to maintain thread safety with LinkedHashMap
+    private static final Object CACHE_LOCK = new Object();
 
     // Expanded list of potential cache targets
     protected final static String[] KNOWN_CACHEABLE_PATHS = {
@@ -422,9 +432,13 @@ class RequestSender {
     private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request) {
         try {
             String cacheKey = service.toString() + Arrays.hashCode(request);
-            Map<String, Object> cached = RESPONSE_CACHE.get(cacheKey);
-            if (cached != null) {
-                return cached;
+            
+            // Thread-safe cache lookup
+            synchronized (CACHE_LOCK) {
+                Map<String, Object> cached = RESPONSE_CACHE.get(cacheKey);
+                if (cached != null) {
+                    return cached;
+                }
             }
 
             // Small delay to avoid overwhelming the target when running multiple threads
@@ -444,7 +458,10 @@ class RequestSender {
                 responseInfo.getBodyOffset(), response.getResponse().length);
             details.put("body", responseBody);
 
-            RESPONSE_CACHE.put(cacheKey, details);
+            // Thread-safe cache insertion
+            synchronized (CACHE_LOCK) {
+                RESPONSE_CACHE.put(cacheKey, details);
+            }
             return details;
         } catch (Exception e) {
             BurpExtender.print("Error making HTTP request: " + e.getMessage());
@@ -482,11 +499,15 @@ class RequestSender {
         double jaroDist = jaroWinkler.apply(cleanedFirst, cleanedSecond);
         int levenDist = levenshtein.apply(cleanedFirst, cleanedSecond);
 
-        // Adjust similarity logic if needed based on new class behavior - JaroWinklerSimilarity returns 0-1 (higher is better)
-        boolean similar = jaroDist >= JARO_THRESHOLD; // Primarily use Jaro-Winkler
-        if (levenDist <= LEVENSHTEIN_THRESHOLD) { // Consider Levenshtein as secondary check? Or adjust threshold.
-            similar = true;
-        }
+        // Fixed similarity logic: Both metrics must indicate similarity for a positive match
+        // JaroWinklerSimilarity returns 0-1 (higher is better)
+        // LevenshteinDistance returns edit distance (lower is better)
+        boolean jaroSimilar = jaroDist >= JARO_THRESHOLD;
+        boolean levenSimilar = levenDist <= LEVENSHTEIN_THRESHOLD;
+        
+        // Require BOTH metrics to indicate similarity to reduce false positives
+        // This prevents cases where very different content has coincidentally low edit distance
+        boolean similar = jaroSimilar && levenSimilar;
 
         results.put("similar", similar);
         results.put("jaro", jaroDist);

@@ -50,11 +50,20 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
     // Submit the scanning job to a shared thread pool so multiple requests can
     // be processed concurrently without spawning excessive threads.
     private void runScannerForRequest(IHttpRequestResponse iHttpRequestResponse) {
-        if (executor != null && !executor.isShutdown()) {
-            executor.submit(new ScannerThread(iHttpRequestResponse));
-        } else {
-            // Fallback if executor is not available
-            new Thread(new ScannerThread(iHttpRequestResponse)).start();
+        // Synchronize to prevent race conditions during executor shutdown
+        synchronized (this) {
+            if (executor != null && !executor.isShutdown()) {
+                try {
+                    executor.submit(new ScannerThread(iHttpRequestResponse));
+                } catch (RejectedExecutionException e) {
+                    // Fallback if executor was shut down between check and submit
+                    print("Executor unavailable, falling back to new thread: " + e.getMessage());
+                    new Thread(new ScannerThread(iHttpRequestResponse)).start();
+                }
+            } else {
+                // Fallback if executor is not available
+                new Thread(new ScannerThread(iHttpRequestResponse)).start();
+            }
         }
     }
 
@@ -450,8 +459,19 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
     @Override
     public void extensionUnloaded() {
-        if (executor != null && !executor.isShutdown()) {
-            executor.shutdownNow();
+        // Synchronize to prevent race conditions with runScannerForRequest
+        synchronized (this) {
+            if (executor != null && !executor.isShutdown()) {
+                executor.shutdownNow();
+                try {
+                    // Wait a bit for tasks to complete
+                    if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                        print("Some scanning tasks may not have completed cleanly");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 }
