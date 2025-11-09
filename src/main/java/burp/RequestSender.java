@@ -79,89 +79,44 @@ class RequestSender {
     private static final Pattern HTML_COMMENT_PATTERN = Pattern.compile("<!--.*?-->", Pattern.DOTALL);
     private static final Pattern CSRF_TOKEN_PATTERN = Pattern.compile("<input[^>]*name=[\"\\'](__RequestVerificationToken|csrf_token|csrfmiddlewaretoken|nonce|authenticity_token|_csrf)[^>]*>", Pattern.CASE_INSENSITIVE);
 
-    private static byte[] orgResponse;
-
     /**
      * Initial test to check if the application ignores trailing path segments
      */
     protected static boolean initialTest(IHttpRequestResponse message) {
-        BurpExtender.print("\n--- Running Initial Tests ---");
-
-        // Get Original Response Details
         byte[] orgRequest = buildHttpRequest(message, null, null, true);
         Map<String, Object> orgDetails = retrieveResponseDetails(message.getHttpService(), orgRequest);
         if (orgDetails == null) {
-            BurpExtender.print("    Original Auth Request FAILED (No response details).");
-            BurpExtender.print("--- Initial Tests FAILED ---");
             return false;
         }
-        // Store original response body for later comparison (needed for Step 2)
         byte[] originalAuthBody = (byte[]) orgDetails.get("body");
-        BurpExtender.print("    Original Auth Response Status: " + (int) orgDetails.get("statusCode"));
 
-
-        BurpExtender.print("  [Step 1/2] Comparing authenticated vs. unauthenticated response for original URL...");
-        // Get Unauthenticated Response Details
         byte[] unAuthedRequest = buildHttpRequest(message, null, null, false);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unAuthedRequest);
         if (unauthDetails == null) {
-            BurpExtender.print("    Original Unauth Request FAILED (No response details).");
-            // We might still proceed to step 2, but this check is less reliable.
-            // Consider returning false here depending on desired strictness.
-             BurpExtender.print("--- Initial Tests FAILED (due to unauth request failure) ---");
             return false; 
         }
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
-        BurpExtender.print("    Original Unauth Response Status: " + (int) unauthDetails.get("statusCode"));
 
-        // Compare original auth vs unauth
         Map<String, Object> step1Similarity = testSimilar(new String(originalAuthBody), new String(unauthBody));
         boolean unauthedIsSimilar = (boolean) step1Similarity.get("similar");
-        // Added verbose logging of similarity metrics for initial test Step 1
-        BurpExtender.print(String.format("    [INFO] Initial Tests Step 1 Similarity -> Jaro=%.3f, Levenshtein=%d", (double) step1Similarity.get("jaro"), (int) step1Similarity.get("levenshtein")));
 
         if (unauthedIsSimilar) {
-            BurpExtender.print("    Result: SIMILAR. Unauthenticated response matches authenticated. Likely not vulnerable or no session handling.");
-            BurpExtender.print("--- Initial Tests FAILED ---");
             return false;
-        } else {
-            BurpExtender.print("    Result: DIFFERENT. Unauthenticated response differs from authenticated (Good). Proceeding...");
         }
 
-        // Generate a random path segment once for this test run
         String randomSegment = generateRandomString(5);
-        BurpExtender.print("  [Step 2/2] Comparing original response vs. response with path segment '" + randomSegment + "' appended...");
-
-        // Get Response Details for Appended Path
-        byte[] testRequest = buildHttpRequestWithSegment(message, randomSegment, null, true, "/"); // Use segment builder
+        byte[] testRequest = buildHttpRequestWithSegment(message, randomSegment, null, true, "/");
         Map<String, Object> appendedDetails = retrieveResponseDetails(message.getHttpService(), testRequest);
         if (appendedDetails == null) {
-            BurpExtender.print("    Appended Path Auth Request FAILED (No response details).");
-            BurpExtender.print("--- Initial Tests FAILED ---");
             return false;
         }
         byte[] appendedBody = (byte[]) appendedDetails.get("body");
-        BurpExtender.print("    Appended Path Auth Response Status: " + (int) appendedDetails.get("statusCode"));
 
-        // Compare original auth vs appended auth
         Map<String, Object> step2Similarity = testSimilar(new String(originalAuthBody), new String(appendedBody));
         boolean appendIsSimilar = (boolean) step2Similarity.get("similar");
-        // Added verbose logging of similarity metrics for initial test Step 2
-        BurpExtender.print(String.format("    [INFO] Initial Tests Step 2 Similarity -> Jaro=%.3f, Levenshtein=%d", (double) step2Similarity.get("jaro"), (int) step2Similarity.get("levenshtein")));
 
-        // Store the random segment regardless of the step 2 outcome
-        message.setComment(randomSegment); // Use comment field to pass the segment
-        
-        if (!appendIsSimilar) {
-            BurpExtender.print("    Result: DIFFERENT. Appending '" + randomSegment + "' significantly changed the response.");
-            BurpExtender.print("    WARNING: Initial path mapping check (Step 2/2) failed, but proceeding with cache tests anyway.");
-            BurpExtender.print("--- Initial Tests Considered PASSED (with warning) ---");
-            return true; // Proceed even if this check fails
-        } else {
-            BurpExtender.print("    Result: SIMILAR. Appending '" + randomSegment + "' yielded a similar response (Good). Potential path mapping issue.");
-            BurpExtender.print("--- Initial Tests PASSED ---");
-            return true;
-        }
+        message.setComment(randomSegment);
+        return true;
     }
 
     /**
@@ -178,13 +133,10 @@ class RequestSender {
         int authStatusCode = (int) authDetails.get("statusCode");
         byte[] authBody = (byte[]) authDetails.get("body");
         
-        // Validate status code - only proceed if it's a successful response (2xx)
         if (authStatusCode < 200 || authStatusCode >= 300) {
-            // BurpExtender.print("    Auth Request returned non-2xx status code: " + authStatusCode);
             return false;
         }
 
-        // Get Unauth Response Details
         byte[] unauthRequest = buildHttpRequestWithSegment(message, randomSegment, ext, false, delimiter);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
         if (unauthDetails == null) {
@@ -193,38 +145,12 @@ class RequestSender {
         int unauthStatusCode = (int) unauthDetails.get("statusCode");
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
 
-        // Validate unauth status code - only proceed if it's a successful response
         if (unauthStatusCode < 200 || unauthStatusCode >= 300) {
-            // BurpExtender.print("    Unauth Request returned non-2xx status code: " + unauthStatusCode);
             return false;
         }
 
-        // Perform similarity test on bodies
         Map<String, Object> similarityResult = testSimilar(new String(authBody), new String(unauthBody));
-        boolean contentSimilar = (boolean) similarityResult.get("similar");
-
-        // For debugging purposes, we might want to check X-Cache headers too
-        @SuppressWarnings("unchecked")
-        List<String> authHeaders = (List<String>) authDetails.get("headers");
-        @SuppressWarnings("unchecked")
-        List<String> unauthHeaders = (List<String>) unauthDetails.get("headers");
-        
-        String xCacheAuth = getHeaderValue(authHeaders, "X-Cache");
-        String xCacheUnauth = getHeaderValue(unauthHeaders, "X-Cache");
-        
-        // Cache hit validation is a plus but not required since not all servers expose X-Cache
-        // boolean cacheHitDetected = xCacheUnauth != null && xCacheUnauth.toLowerCase().contains("hit");
-
-        if (contentSimilar) {
-            // Enhanced debugging - log detailed information for hits
-            BurpExtender.print("    [DEBUG] Delimiter='" + delimiter + "', Extension=." + ext 
-                + ", Status: Auth=" + authStatusCode + ", Unauth=" + unauthStatusCode
-                + ", X-Cache: Auth=" + (xCacheAuth == null ? "N/A" : xCacheAuth) 
-                + ", Unauth=" + (xCacheUnauth == null ? "N/A" : xCacheUnauth));
-            return true;
-        } else {
-            return false;
-        }
+        return (boolean) similarityResult.get("similar");
     }
 
     /**
@@ -233,66 +159,28 @@ class RequestSender {
      */
     protected static boolean testNormalizationCaching(IHttpRequestResponse message, String delimiter, String cacheablePath, String template) {
         String targetPath = BurpExtender.getHelpers().analyzeRequest(message).getUrl().getPath();
-        // Ensure cacheablePath starts with / for correct substringing
         if (!cacheablePath.startsWith("/")) {
-             // BurpExtender.print("Skipping normalization test for invalid cacheable path: " + cacheablePath);
              return false;
         }
         String cacheablePathRelative = cacheablePath.substring(1);
         String normalizationSuffix = template + cacheablePathRelative;
-        String testingPathStructure = targetPath + delimiter + normalizationSuffix;
 
-        // BurpExtender.print("\n--- Running Normalization Cache Test ---");
-        // BurpExtender.print("  Template Used: " + template);
-        // BurpExtender.print("  Delimiter: '" + delimiter + "'");
-        // BurpExtender.print("  Target Cache Path: " + cacheablePath);
-        // BurpExtender.print("  Testing Path Structure: " + testingPathStructure);
-        // BurpExtender.print("  Comparing authenticated vs. unauthenticated response for the crafted path...");
-
-        // Get Auth Response Details
         byte[] authRequest = buildHttpRequestWithNormalization(message, true, delimiter, normalizationSuffix);
         Map<String, Object> authDetails = retrieveResponseDetails(message.getHttpService(), authRequest);
         if (authDetails == null) {
-            // BurpExtender.print("    Auth Request FAILED (No response details).");
-            // BurpExtender.print("--- Normalization Test FAILED for Template: " + template + ", Delimiter: '" + delimiter + "', Path: " + cacheablePath + " ---");
             return false;
         }
-        // int authStatusCode = (int) authDetails.get("statusCode");
         byte[] authBody = (byte[]) authDetails.get("body");
-        // BurpExtender.print("    Auth Response Status: " + authStatusCode);
 
-        // Get Unauth Response Details
         byte[] unauthRequest = buildHttpRequestWithNormalization(message, false, delimiter, normalizationSuffix);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
         if (unauthDetails == null) {
-            // BurpExtender.print("    Unauth Request FAILED (No response details).");
-            // BurpExtender.print("--- Normalization Test FAILED for Template: " + template + ", Delimiter: '" + delimiter + "', Path: " + cacheablePath + " ---");
             return false;
         }
-        // int unauthStatusCode = (int) unauthDetails.get("statusCode");
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
-        // BurpExtender.print("    Unauth Response Status: " + unauthStatusCode);
 
-        // Perform similarity test
         Map<String, Object> similarityResult = testSimilar(new String(authBody), new String(unauthBody));
-        boolean contentSimilar = (boolean) similarityResult.get("similar");
-
-        if (contentSimilar) {
-            // Print details only on success - NOW COMMENTED OUT
-            // BurpExtender.print("\n--- NORMALIZATION CACHE TEST PASSED ---");
-            // BurpExtender.print("  Testing Path Structure: " + testingPathStructure);
-            // BurpExtender.print("    Template Used: " + template);
-            // BurpExtender.print("    Target Cache Path: " + cacheablePath);
-            // BurpExtender.print("    Result: SIMILAR. Unauthenticated request received similar content to authenticated.");
-            // BurpExtender.print("    Conclusion: Path appears to be CACHED and serving authenticated content.");
-            // BurpExtender.print("--- Normalization Test PASSED for Template: " + template + ", Delimiter: '" + delimiter + "', Path: " + cacheablePath + " ---");
-        } else {
-            // Suppress failure messages
-            // BurpExtender.print("    Result: DIFFERENT. Unauthenticated response differs from authenticated.");
-            // BurpExtender.print("    Conclusion: Path " + testingPathStructure + " does NOT appear vulnerable to caching.");
-            // BurpExtender.print("--- Normalization Test FAILED for Template: " + template + ", Delimiter: '" + delimiter + "', Path: " + cacheablePath + " ---");
-        }
-        return contentSimilar;
+        return (boolean) similarityResult.get("similar");
     }
 
     // Renamed original buildHttpRequest to avoid confusion
@@ -332,10 +220,7 @@ class RequestSender {
                 }
             }
         } else { // Create POST message (Handle POST differently or maybe skip for now?)
-            // NOTE: Modifying POST requests with path segments/delimiters is more complex
-            //       and might break applications. Sticking to GET for now.
-            BurpExtender.print("Skipping POST request modification for delimiter test.");
-            return null; // Don't modify POST for now
+            return null;
         }
 
         return result;
@@ -355,7 +240,6 @@ class RequestSender {
         byte[] result = null;
 
         if (!"GET".equals(reqInfo.getMethod())) {
-             BurpExtender.print("Skipping non-GET request for normalization test.");
              return null;
         }
 
@@ -385,8 +269,6 @@ class RequestSender {
             result = BurpExtender.getHelpers().buildHttpMessage(newHeaders, null); // Null body for GET
 
         } catch (Exception e) {
-            BurpExtender.print("Error building normalization request: " + e.getMessage());
-            e.printStackTrace(new java.io.PrintStream(BurpExtender.getCallbacks().getStderr()));
             return null;
         }
 
@@ -464,7 +346,6 @@ class RequestSender {
             }
             return details;
         } catch (Exception e) {
-            BurpExtender.print("Error making HTTP request: " + e.getMessage());
             return null;
         }
     }
@@ -512,11 +393,6 @@ class RequestSender {
         results.put("similar", similar);
         results.put("jaro", jaroDist);
         results.put("levenshtein", levenDist);
-
-        // Keep print statement for now, but it uses the old variables - NOW COMMENTING OUT
-        // BurpExtender.print(String.format("    Similarity Scores (cleaned): Jaro=%.3f, Levenshtein=%d -> Similar: %s",
-        //                      jaroDist, levenDist, similar));
-
         return results;
     }
 
@@ -544,106 +420,47 @@ class RequestSender {
         String targetPath = originalReqInfo.getUrl().getPath();
         String fullTestPath = targetPath + delimiter + relativePathSegment; // Construct the full path
 
-        // --- Get Original Authenticated Content ---
-        BurpExtender.print("    [DEBUG] Fetching original authenticated content for path: " + targetPath);
-        byte[] originalAuthRequestBytes = buildHttpRequestWithFullPath(message, true, targetPath); // Request to original path
+        byte[] originalAuthRequestBytes = buildHttpRequestWithFullPath(message, true, targetPath);
         if (originalAuthRequestBytes == null) {
-             BurpExtender.print("    [DEBUG] Failed to build request for original content.");
              return false;
         }
         Map<String, Object> originalAuthDetails = retrieveResponseDetails(message.getHttpService(), originalAuthRequestBytes);
         if (originalAuthDetails == null || (int) originalAuthDetails.get("statusCode") < 200 || (int) originalAuthDetails.get("statusCode") >= 300) {
-             BurpExtender.print("    [DEBUG] Failed to retrieve valid original authenticated content (Status: " + (originalAuthDetails != null ? originalAuthDetails.get("statusCode") : "N/A") + "). Cannot verify FP.");
-             return false; // Cannot verify against original content if it fails
+             return false;
         }
         byte[] originalAuthBody = (byte[]) originalAuthDetails.get("body");
-        BurpExtender.print("    [DEBUG] Original authenticated content fetched successfully.");
-        // --- End Original Content Fetch ---
 
-
-        // --- First request (auth) to the CRAFTED path ---
         byte[] requestBytes1 = buildHttpRequestWithFullPath(message, true, fullTestPath);
         if (requestBytes1 == null) {
-            BurpExtender.print("    [DEBUG] Failed to build crafted path request 1.");
             return false;
         }
 
         Map<String, Object> details1 = retrieveResponseDetails(message.getHttpService(), requestBytes1);
         if (details1 == null) {
-             BurpExtender.print("    [DEBUG] Failed to get response 1 for crafted path test.");
             return false;
         }
         int statusCode1 = (int) details1.get("statusCode");
-        @SuppressWarnings("unchecked")
-        List<String> headers1 = (List<String>) details1.get("headers");
-        byte[] body1 = (byte[]) details1.get("body");
-        String xCacheHeader1 = getHeaderValue(headers1, "X-Cache");
-
-        // Validate status code for first request - must be 2xx
-        boolean firstReqOk = statusCode1 >= 200 && statusCode1 < 300;
-        if (!firstReqOk) {
-            // Log detailed debug info for specific patterns that should have worked
-            // if (delimiter.equals("%23") && relativePathSegment.contains("%2f%2e%2e%2f")) { // Keep existing debug?
-            //     BurpExtender.print("    [DEBUG] Testing known pattern: Delim='" + delimiter + "' Prefix='"
-            //         + relativePathSegment.substring(0, Math.min(relativePathSegment.length(), 15)) + "...' Path=" + fullTestPath);
-            //     BurpExtender.print("    [DEBUG] Req1: Status=" + statusCode1 + ", X-Cache="
-            //         + (xCacheHeader1 != null ? xCacheHeader1 : "N/A") + ", FirstReqOK=" + firstReqOk);
-            // }
-             BurpExtender.print("    [DEBUG] RelativeNorm Req1 to " + fullTestPath + " failed (Status: " + statusCode1 + ").");
+        if (statusCode1 < 200 || statusCode1 >= 300) {
             return false;
         }
 
-        // --- Second request (auth) to the CRAFTED path to check for caching ---
-        try { Thread.sleep(100); } catch (InterruptedException ignored) {} // Small delay
-        byte[] requestBytes2 = requestBytes1; // Re-use the same request bytes
+        try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+        byte[] requestBytes2 = requestBytes1;
         Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
         if (details2 == null) {
-             BurpExtender.print("    [DEBUG] Failed to get response 2 for crafted path test.");
             return false;
         }
         int statusCode2 = (int) details2.get("statusCode");
-        @SuppressWarnings("unchecked")
-        List<String> headers2 = (List<String>) details2.get("headers");
-        byte[] body2 = (byte[]) details2.get("body");
-        String xCacheHeader2 = getHeaderValue(headers2, "X-Cache");
-
-        // Check second response: must be 200 OK
-        boolean secondReqOk = statusCode2 == 200; // More strict check - must be 200 OK
-        boolean cacheHitDetected = xCacheHeader2 != null && xCacheHeader2.toLowerCase().contains("hit"); // Still note cache hit
-
-        BurpExtender.print("    [DEBUG] RelativeNorm Req2: Status=" + statusCode2 + ", X-Cache="
-                    + (xCacheHeader2 != null ? xCacheHeader2 : "N/A") + ", SecondReqOK=" + secondReqOk
-                    + ", CacheHit=" + cacheHitDetected);
-
-
-        if (!secondReqOk) {
-             BurpExtender.print("    [DEBUG] RelativeNorm Req2 failed (Status: " + statusCode2 + ").");
+        if (statusCode2 != 200) {
             return false;
         }
 
-        // --- CRUCIAL CHECK: Compare body2 (from crafted path) with originalAuthBody ---
-        BurpExtender.print("    [DEBUG] Comparing Response Body 2 (from " + fullTestPath + ") against Original Auth Body (from " + targetPath + ")");
+        @SuppressWarnings("unchecked")
+        List<String> headers2 = (List<String>) details2.get("headers");
+        byte[] body2 = (byte[]) details2.get("body");
+
         Map<String, Object> similarityResult = testSimilar(new String(originalAuthBody), new String(body2));
-        boolean contentMatchesOriginal = (boolean) similarityResult.get("similar");
-
-        BurpExtender.print("    [DEBUG] Content Matches Original: " + contentMatchesOriginal
-                + String.format(" (Jaro=%.3f, Levenshtein=%d)", (double) similarityResult.get("jaro"), (int) similarityResult.get("levenshtein")));
-
-        // Pass if the second request was OK (200) AND its content matches the original authenticated content.
-        // The cache hit is a good indicator but not strictly required if content matches.
-        if (secondReqOk && contentMatchesOriginal) {
-             BurpExtender.print("    [SUCCESS] Relative Normalization Exploit Confirmed: Crafted path served original content.");
-             return true;
-        } else {
-             BurpExtender.print("    [INFO] Relative Normalization Pattern (" + fullTestPath + ") did not serve original content or failed checks.");
-             // Old debug logic based on body1 vs body2 comparison (less reliable) - keep commented out for reference?
-             // if (delimiter.equals("%23") && relativePathSegment.contains("%2f%2e%2e%2f")) {
-             //    Map<String, Object> oldSimilarity = testSimilar(new String(body1), new String(body2));
-             //    boolean oldContentSimilar = (boolean) oldSimilarity.get("similar");
-             //    BurpExtender.print("    [DEBUG Ref] Old Check (Body1 vs Body2): Similar=" + oldContentSimilar + ", CacheHit=" + cacheHitDetected);
-             // }
-             return false;
-        }
+        return (boolean) similarityResult.get("similar");
     }
 
     /**
@@ -655,9 +472,8 @@ class RequestSender {
 
         // Find the request line (first header)
         String requestLine = headers.get(0);
-        String[] parts = requestLine.split(" ", 3); // Split "METHOD PATH HTTP/VERSION"
+        String[] parts = requestLine.split(" ", 3);
         if (parts.length < 3) {
-            BurpExtender.print("  Error: Could not parse request line: " + requestLine);
             return null;
         }
         String method = parts[0];
@@ -721,15 +537,8 @@ class RequestSender {
         String relativePathSegment = "%2f%2e%2e%2f" + normalizedPrefix; // e.g., %2f%2e%2e%2fresources/
 
         String targetPath = BurpExtender.getHelpers().analyzeRequest(message).getUrl().getPath();
-        String fullTestPath = targetPath + delimiter + relativePathSegment; // Construct the full path
+        String fullTestPath = targetPath + delimiter + relativePathSegment;
 
-        // --- Add specific logging for the known-good exploit pattern ---
-        boolean isTargetPattern = delimiter.equals("%23") && prefix.equals("/resources/");
-        if (isTargetPattern) {
-            BurpExtender.print("\n  [DEBUG] Testing known pattern: Delim='" + delimiter + "' Prefix='" + prefix + "' Path=" + fullTestPath);
-        }
-
-        // --- First Request --- 
         byte[] requestBytes1 = buildHttpRequestWithFullPath(message, true, fullTestPath);
         if (requestBytes1 == null) return false;
         Map<String, Object> details1 = retrieveResponseDetails(message.getHttpService(), requestBytes1);
@@ -739,9 +548,6 @@ class RequestSender {
         byte[] body1 = (byte[]) details1.get("body");
         String xCacheHeader1 = getHeaderValue(headers1, "X-Cache");
         boolean firstReqOk = statusCode1 == 200 && (xCacheHeader1 == null || !xCacheHeader1.toLowerCase().contains("hit"));
-        if (isTargetPattern) {
-             BurpExtender.print("    [DEBUG] Req1: Status=" + statusCode1 + ", X-Cache=" + (xCacheHeader1 != null ? xCacheHeader1 : "null") + ", FirstReqOK=" + firstReqOk);
-        }
         if (!firstReqOk) return false;
 
         // --- Second Request --- 
@@ -782,73 +588,39 @@ class RequestSender {
      */
     protected static boolean testHashPathTraversal(IHttpRequestResponse message, String resource, String traversalPattern) {
         String targetPath = BurpExtender.getHelpers().analyzeRequest(message).getUrl().getPath();
-        String hashDelimiter = "%23"; // URL-encoded #
+        String hashDelimiter = "%23";
         String relativePathSegment = traversalPattern + resource;
         String fullTestPath = targetPath + hashDelimiter + relativePathSegment;
         
-        // For debugging
-        BurpExtender.print("    [DEBUG] Testing critical hash pattern: Path=" + fullTestPath);
-        
-        // Create and send first request (auth)
         byte[] requestBytes1 = buildHttpRequestWithFullPath(message, true, fullTestPath);
         if (requestBytes1 == null) {
-            BurpExtender.print("    [DEBUG] Failed to build hash test request");
             return false;
         }
 
         Map<String, Object> details1 = retrieveResponseDetails(message.getHttpService(), requestBytes1);
         if (details1 == null) {
-            BurpExtender.print("    [DEBUG] Failed to get response for hash test");
             return false;
         }
         
         int statusCode1 = (int) details1.get("statusCode");
-        BurpExtender.print("    [DEBUG] Hash test response status: " + statusCode1);
-        
-        // We explicitly check if the status code is 200 (OK) or 302 (redirect) as both might indicate a valid path
-        // 404 is a clear sign that the pattern doesn't work on this site
         if (statusCode1 != 200 && statusCode1 != 302) {
-            BurpExtender.print("    [DEBUG] Hash pattern test failed - non-200/302 status code: " + statusCode1);
             return false;
         }
         
-        // For 200 OK responses, try to validate caching behavior
         if (statusCode1 == 200) {
-            // Get headers and body from first request
-            @SuppressWarnings("unchecked")
-            List<String> headers1 = (List<String>) details1.get("headers");
-            byte[] body1 = (byte[]) details1.get("body");
-            String xCacheHeader1 = getHeaderValue(headers1, "X-Cache");
-            
-            // Make a second request to see if it's served from cache
-            byte[] requestBytes2 = requestBytes1; // Use the same request
+            byte[] requestBytes2 = requestBytes1;
             Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
             
             if (details2 != null) {
-                int statusCode2 = (int) details2.get("statusCode");
                 @SuppressWarnings("unchecked")
                 List<String> headers2 = (List<String>) details2.get("headers");
                 String xCacheHeader2 = getHeaderValue(headers2, "X-Cache");
-                
-                // Check for cache hit in second response
                 boolean cacheHitDetected = xCacheHeader2 != null && xCacheHeader2.toLowerCase().contains("hit");
-                
-                if (cacheHitDetected) {
-                    BurpExtender.print("    [DEBUG] Success! Hash pattern is cacheable - X-Cache: " + xCacheHeader2);
-                    return true;
-                }
-                
-                BurpExtender.print("    [DEBUG] Hash pattern response 200 OK but no cache hit detected.");
-                // We still return true because a 200 OK is promising even without cache headers
-                return true;
+                return cacheHitDetected;
             }
-        } else if (statusCode1 == 302) {
-            // For redirects, this might still be exploitable in some cases
-            BurpExtender.print("    [DEBUG] Hash pattern resulted in a redirect - potentially exploitable");
-            return true;
         }
         
-        return false;
+        return statusCode1 == 302;
     }
     
     /**
@@ -875,18 +647,13 @@ class RequestSender {
         if (lastSlash == targetPath.length() - 1 && targetPath.length() > 1) { // Ends with slash, not root
              int secondLastSlash = targetPath.lastIndexOf('/', lastSlash - 1);
              targetFilename = targetPath.substring(secondLastSlash + 1, lastSlash);
-        } else if (lastSlash == -1 || lastSlash == 0) { // No slash (e.g., "filename") or root path
-             // Cannot reliably get a filename to append in these cases for self-reference
-             // Or maybe default to index.html? For now, let's skip these cases.
-             // Consider logging this situation if it occurs frequently.
-             // BurpExtender.print("    [DEBUG] Skipping self-ref test for path: " + targetPath + " (cannot extract filename)");
+        } else if (lastSlash == -1 || lastSlash == 0) {
              return false;
-        } else { // Standard case like /path/to/file
+        } else {
              targetFilename = targetPath.substring(lastSlash + 1);
         }
         if (targetFilename.isEmpty()){
-             // BurpExtender.print("    [DEBUG] Skipping self-ref test for path: " + targetPath + " (extracted empty filename)");
-             return false; // Cannot append empty filename
+             return false;
         }
 
 
@@ -905,17 +672,12 @@ class RequestSender {
 
         String fullTestPath = targetPath + delimiter + processedIntermediate + traversalPattern + targetFilename;
 
-        BurpExtender.print("    [DEBUG] Testing self-referential pattern: Path=" + fullTestPath);
-
-        // --- First Request (Auth, expect cache miss/non-hit) ---
         byte[] requestBytes1 = buildHttpRequestWithFullPath(message, true, fullTestPath);
         if (requestBytes1 == null) {
-            BurpExtender.print("    [DEBUG] Failed to build self-ref request 1");
             return false;
         }
         Map<String, Object> details1 = retrieveResponseDetails(message.getHttpService(), requestBytes1);
         if (details1 == null) {
-            BurpExtender.print("    [DEBUG] Failed to get response 1 for self-ref test");
             return false;
         }
         int statusCode1 = (int) details1.get("statusCode");
@@ -923,62 +685,36 @@ class RequestSender {
         byte[] body1 = (byte[]) details1.get("body");
         String xCacheHeader1 = getHeaderValue(headers1, "X-Cache");
 
-        // Primary check is for 200 OK. We also note if it was unexpectedly a cache hit.
         boolean firstReqOk = statusCode1 == 200;
         boolean firstReqHit = xCacheHeader1 != null && xCacheHeader1.toLowerCase().contains("hit");
-        BurpExtender.print("    [DEBUG] Self-Ref Req1: Status=" + statusCode1 + ", X-Cache=" + (xCacheHeader1 != null ? xCacheHeader1 : "null") + ", FirstReqOK=" + firstReqOk + ", FirstReqHit=" + firstReqHit);
-
-        // If the first request failed (non-200) or was already a cache hit, this specific path isn't demonstrating the Miss->Hit behavior.
-        // However, a 200 response even on first hit might still be interesting if content matches unauth later, but less classic WCD.
         if (!firstReqOk) {
             return false;
         }
 
-        // --- Second Request (Auth, expect cache hit ideally) ---
-        try { Thread.sleep(150); } catch (InterruptedException ignored) {} // Slightly longer delay
-        byte[] requestBytes2 = requestBytes1; // Re-use the same request
+        try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+        byte[] requestBytes2 = requestBytes1;
         Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
         if (details2 == null) {
-            BurpExtender.print("    [DEBUG] Failed to get response 2 for self-ref test");
-            // Consider returning true based on Req1 if statusCode1 was 200? Or stick to requiring confirmation.
-            return false; // Stick to requiring confirmation for now
+            return false;
         }
         int statusCode2 = (int) details2.get("statusCode");
         @SuppressWarnings("unchecked") List<String> headers2 = (List<String>) details2.get("headers");
         byte[] body2 = (byte[]) details2.get("body");
         String xCacheHeader2 = getHeaderValue(headers2, "X-Cache");
 
-        boolean secondReqOk = statusCode2 == 200; // Must be 200 OK
+        boolean secondReqOk = statusCode2 == 200;
         boolean cacheHitDetected = xCacheHeader2 != null && xCacheHeader2.toLowerCase().contains("hit");
-        BurpExtender.print("    [DEBUG] Self-Ref Req2: Status=" + statusCode2 + ", X-Cache=" + (xCacheHeader2 != null ? xCacheHeader2 : "null") + ", SecondReqOK=" + secondReqOk + ", CacheHit=" + cacheHitDetected);
-
-        // Success conditions:
-        // 1. Classic: First request was OK (200) and NOT a hit, Second request was OK (200) AND IS a hit.
-        // 2. Fallback: Both requests OK (200), no definitive cache hit signal, but content is similar.
-        // 3. Permissive: First request was OK (200), Second request was OK (200). (Might indicate exploitable but not classic caching)
 
         boolean classicHitScenario = firstReqOk && !firstReqHit && secondReqOk && cacheHitDetected;
-
         if (classicHitScenario) {
-            BurpExtender.print("    [SUCCESS] Self-Ref Classic Miss->Hit pattern detected!");
-            // Optionally compare content similarity for extra confidence
-            // Map<String, Object> similarityResult = testSimilar(new String(body1), new String(body2));
-            // BurpExtender.print("      Content Similar: " + similarityResult.get("similar"));
             return true;
         }
 
-        // If no classic hit, check for consistent 200 OK and similar content (fallback for caches without clear headers)
         if (firstReqOk && secondReqOk) {
              Map<String, Object> similarityResult = testSimilar(new String(body1), new String(body2));
-             boolean contentSimilar = (boolean) similarityResult.get("similar");
-             BurpExtender.print("    [DEBUG] Self-Ref Content Similarity (Req1 vs Req2): " + contentSimilar + " (Jaro: " + String.format("%.3f", similarityResult.get("jaro")) + ")");
-             if (contentSimilar) {
-                  BurpExtender.print("    [SUCCESS] Self-Ref Fallback: Consistent 200 OK and Similar Content detected!");
-                  return true;
-             }
+             return (boolean) similarityResult.get("similar");
         }
 
-        // If none of the success conditions met
         return false;
     }
 
@@ -1038,21 +774,15 @@ class RequestSender {
             traversal.append("..%2f");
         }
         
-        // Construct the test path: /cacheable/path/..%2fsensitive
         String fullTestPath = normalizedCachePath + traversal.toString() + sensitiveFilename;
         
-        BurpExtender.print("  [DEBUG] Testing Reverse Traversal: " + fullTestPath);
-        
-        // --- Get Original Sensitive Content (for verification) ---
         byte[] originalAuthRequestBytes = buildHttpRequestWithFullPath(message, true, sensitiveTargetPath);
         Map<String, Object> originalAuthDetails = retrieveResponseDetails(message.getHttpService(), originalAuthRequestBytes);
         if (originalAuthDetails == null || (int)originalAuthDetails.get("statusCode") != 200) {
-            BurpExtender.print("  [DEBUG] Cannot fetch original sensitive content for comparison");
             return false;
         }
         byte[] originalAuthBody = (byte[]) originalAuthDetails.get("body");
         
-        // --- First Request (Auth) to the reverse traversal path ---
         byte[] requestBytes1 = buildHttpRequestWithFullPath(message, true, fullTestPath);
         Map<String, Object> details1 = retrieveResponseDetails(message.getHttpService(), requestBytes1);
         if (details1 == null) {
@@ -1063,31 +793,18 @@ class RequestSender {
         @SuppressWarnings("unchecked") 
         List<String> headers1 = (List<String>) details1.get("headers");
         byte[] body1 = (byte[]) details1.get("body");
-        String xCacheHeader1 = getHeaderValue(headers1, "X-Cache");
         
-        // First request should succeed and NOT be a cache hit
-        boolean firstReqOk = statusCode1 == 200;
-        boolean firstReqNoHit = xCacheHeader1 == null || !xCacheHeader1.toLowerCase().contains("hit");
-        
-        BurpExtender.print("  [DEBUG] Reverse Test Req1: Status=" + statusCode1 + 
-                          ", X-Cache=" + (xCacheHeader1 != null ? xCacheHeader1 : "N/A"));
-        
-        if (!firstReqOk) {
+        if (statusCode1 != 200) {
             return false;
         }
         
-        // --- CRUCIAL: Verify this actually returns the sensitive content ---
         Map<String, Object> contentMatchResult = testSimilar(new String(originalAuthBody), new String(body1));
-        boolean returnsSensitiveContent = (boolean) contentMatchResult.get("similar");
-        if (!returnsSensitiveContent) {
-            BurpExtender.print("  [DEBUG] Reverse path traversal returns a 200 response but NOT the sensitive content");
+        if (!(boolean) contentMatchResult.get("similar")) {
             return false;
         }
-        BurpExtender.print("  [DEBUG] Reverse path returns sensitive content (content match confirmed)");
         
-        // --- Second Request (Auth) to check for caching ---
         try { Thread.sleep(150); } catch (InterruptedException ignored) {}
-        byte[] requestBytes2 = requestBytes1; // Re-use the same request
+        byte[] requestBytes2 = requestBytes1;
         Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
         if (details2 == null) {
             return false;
@@ -1101,15 +818,9 @@ class RequestSender {
         boolean secondReqOk = statusCode2 == 200;
         boolean cacheHitDetected = xCacheHeader2 != null && xCacheHeader2.toLowerCase().contains("hit");
         
-        BurpExtender.print("  [DEBUG] Reverse Test Req2: Status=" + statusCode2 + 
-                          ", X-Cache=" + (xCacheHeader2 != null ? xCacheHeader2 : "N/A") + 
-                          ", CacheHit=" + cacheHitDetected);
-        
-        // --- Now try an unauthenticated request to see if we get the sensitive content ---
         byte[] unauthRequestBytes = buildHttpRequestWithFullPath(message, false, fullTestPath);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequestBytes);
         if (unauthDetails == null) {
-            // Can't verify unauth access, but still return true if we detected caching behavior
             return secondReqOk && cacheHitDetected;
         }
         
@@ -1117,27 +828,14 @@ class RequestSender {
         @SuppressWarnings("unchecked") 
         List<String> unauthHeaders = (List<String>) unauthDetails.get("headers");
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
-        String unauthXCache = getHeaderValue(unauthHeaders, "X-Cache");
         
-        boolean unauthReqOk = unauthStatusCode == 200;
-        boolean unauthCacheHit = unauthXCache != null && unauthXCache.toLowerCase().contains("hit");
-        
-        BurpExtender.print("  [DEBUG] Reverse Test Unauth: Status=" + unauthStatusCode + 
-                          ", X-Cache=" + (unauthXCache != null ? unauthXCache : "N/A") + 
-                          ", CacheHit=" + unauthCacheHit);
-        
-        // Check if unauth request returns the sensitive content (definitive proof)
-        if (unauthReqOk) {
+        if (unauthStatusCode == 200) {
             Map<String, Object> unauthSimilarity = testSimilar(new String(originalAuthBody), new String(unauthBody));
-            boolean unauthGetsSensitiveContent = (boolean) unauthSimilarity.get("similar");
-            
-            if (unauthGetsSensitiveContent) {
-                BurpExtender.print("  [SUCCESS] CRITICAL: Unauthenticated request receives sensitive content via reverse traversal!");
+            if ((boolean) unauthSimilarity.get("similar")) {
                 return true;
             }
         }
         
-        // If we couldn't definitively prove unauth access, still return true if we detected caching
         return secondReqOk && cacheHitDetected;
     }
 }

