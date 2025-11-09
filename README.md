@@ -1,12 +1,6 @@
-# Web Cache Deception Scanner - Burp Extension (Community Edition)
+# Web Cache Deception Scanner - Burp Extension Community Edition
 
 This is a Burp Suite extension to test web applications for various Web Cache Deception vulnerabilities. This version has been modified to work with the **Burp Suite Community Edition**.
-
-
-## Disclaimer
-
-This project was developed as an experiment with the assistance of artificial intelligence (AI). While every effort has been made to ensure accuracy and functionality, this extension is provided as-is and for research purposes only. The author(s) and contributors are not responsible for any use, misuse, or damages resulting from this software. Please use it responsibly and at your own risk.
-
 
 ## Functionality
 
