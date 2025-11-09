@@ -2,6 +2,8 @@ package burp;
 
 import org.apache.commons.text.similarity.JaroWinklerSimilarity;
 import org.apache.commons.text.similarity.LevenshteinDistance;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -15,23 +17,36 @@ import java.util.HashMap;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.LinkedHashMap;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 class RequestSender {
 
     private final static double   JARO_THRESHOLD = 0.8;
     private final static int      LEVENSHTEIN_THRESHOLD = 200;
     private final static int      CACHE_MAX_SIZE = 1000; // Maximum cache entries
-
-    // Thread-safe bounded cache with LRU eviction to prevent memory leaks
-    private static final Map<String, Map<String, Object>> RESPONSE_CACHE = new LinkedHashMap<String, Map<String, Object>>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, Map<String, Object>> eldest) {
-            return size() > CACHE_MAX_SIZE;
-        }
-    };
+    private final static int      CACHE_TTL_SECONDS = 300; // 5 minutes TTL
+    private final static int      MAX_RETRIES = 3;
+    private final static int      REQUEST_TIMEOUT_MS = 10000; // 10 seconds
+    private final static int      MIN_RETRY_DELAY_MS = 100;
+    private final static int      MAX_RETRY_DELAY_MS = 2000;
     
-    // Synchronize cache access to maintain thread safety with LinkedHashMap
-    private static final Object CACHE_LOCK = new Object();
+    // High-performance Caffeine cache with TTL
+    private static final Cache<String, Map<String, Object>> RESPONSE_CACHE = Caffeine.newBuilder()
+            .maximumSize(CACHE_MAX_SIZE)
+            .expireAfterWrite(CACHE_TTL_SECONDS, TimeUnit.SECONDS)
+            .build();
+    
+    // Rate limiting and circuit breaker state per host
+    private static final Map<String, AtomicInteger> REQUEST_COUNTS = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicLong> LAST_REQUEST_TIME = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicInteger> FAILURE_COUNTS = new ConcurrentHashMap<>();
+    private static final int MAX_REQUESTS_PER_SECOND = 10;
+    private static final int CIRCUIT_BREAKER_THRESHOLD = 5;
+    private static final long CIRCUIT_BREAKER_RESET_MS = 60000; // 1 minute
 
     // Expanded list of potential cache targets
     protected final static String[] KNOWN_CACHEABLE_PATHS = {
@@ -74,10 +89,34 @@ class RequestSender {
         "..%2f",       // ../ encoded slash
         "%2f..%2f"     // /../ encoded slashes
     };
+    
+    // Expanded delimiter set for advanced attacks
+    protected final static String[] ADVANCED_DELIMITERS = {
+        "/", ";", "?", "%23", "%3f", "@", "&", "~", "|", "%20", "%09", "%0a"
+    };
+    
+    // Header-based cache key attack headers
+    protected final static String[] CACHE_KEY_HEADERS = {
+        "X-Forwarded-Host", "X-Original-URL", "X-Rewrite-URL", 
+        "X-Forwarded-For", "X-Real-IP", "X-Forwarded-Proto"
+    };
+    
+    // CDN fingerprinting patterns
+    protected final static Map<String, String[]> CDN_PATTERNS = new HashMap<>();
+    static {
+        CDN_PATTERNS.put("cloudflare", new String[]{"CF-Cache-Status", "CF-Ray", "Server: cloudflare"});
+        CDN_PATTERNS.put("akamai", new String[]{"X-Akamai-", "Akamai-GRN"});
+        CDN_PATTERNS.put("fastly", new String[]{"Fastly-", "X-Served-By"});
+        CDN_PATTERNS.put("varnish", new String[]{"X-Varnish", "Via: .*varnish"});
+        CDN_PATTERNS.put("squid", new String[]{"X-Squid-Error", "Server: squid"});
+    }
 
     // Regex patterns for stripping dynamic content
     private static final Pattern HTML_COMMENT_PATTERN = Pattern.compile("<!--.*?-->", Pattern.DOTALL);
     private static final Pattern CSRF_TOKEN_PATTERN = Pattern.compile("<input[^>]*name=[\"\\'](__RequestVerificationToken|csrf_token|csrfmiddlewaretoken|nonce|authenticity_token|_csrf)[^>]*>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern TIMESTAMP_PATTERN = Pattern.compile("(timestamp|time|date|_t|_ts|_time|_date)=\\d+", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SESSION_ID_PATTERN = Pattern.compile("(sessionid|jsessionid|phpsessid|aspsessionid)=[a-zA-Z0-9]+", Pattern.CASE_INSENSITIVE);
+    private static final Pattern UUID_PATTERN = Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", Pattern.CASE_INSENSITIVE);
 
     /**
      * Initial test to check if the application ignores trailing path segments
@@ -227,7 +266,7 @@ class RequestSender {
     }
 
     // Added overload for backward compatibility
-    private static byte[] buildHttpRequest(final IHttpRequestResponse reqRes, final String additional, final String extension,
+    protected static byte[] buildHttpRequest(final IHttpRequestResponse reqRes, final String additional, final String extension,
                                      boolean addCookies) {
         return buildHttpRequestWithSegment(reqRes, additional, extension, addCookies, "/"); // Default to / delimiter (String)
     }
@@ -307,27 +346,51 @@ class RequestSender {
     }
 
     /**
-     * Retrieves response body and status code.
+     * Retrieves response body and status code with retry logic, rate limiting, and circuit breaker.
      * Returns a Map with keys "body" (byte[]), "statusCode" (int), and "headers" (List<String>).
-     * Now uses a cache to avoid duplicate requests and adaptive rate limiting.
+     * Uses Caffeine cache for high-performance caching with TTL.
      */
-    private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request) {
+    protected static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request) {
+        return retrieveResponseDetails(service, request, 0);
+    }
+    
+    private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request, int retryCount) {
         try {
+            String hostKey = service.getHost();
             String cacheKey = service.toString() + Arrays.hashCode(request);
             
-            // Thread-safe cache lookup
-            synchronized (CACHE_LOCK) {
-                Map<String, Object> cached = RESPONSE_CACHE.get(cacheKey);
-                if (cached != null) {
-                    return cached;
-                }
+            // Check circuit breaker
+            if (isCircuitOpen(hostKey)) {
+                BurpExtender.logDebug("Circuit breaker open for " + hostKey);
+                return null;
+            }
+            
+            // Rate limiting
+            if (!checkRateLimit(hostKey)) {
+                try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+            }
+            
+            // Check cache first
+            Map<String, Object> cached = RESPONSE_CACHE.getIfPresent(cacheKey);
+            if (cached != null) {
+                return cached;
             }
 
-            // Small delay to avoid overwhelming the target when running multiple threads
-            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            // Adaptive delay based on host response times
+            long delay = calculateAdaptiveDelay(hostKey);
+            try { Thread.sleep(delay); } catch (InterruptedException ignored) {}
 
+            long startTime = System.currentTimeMillis();
             IHttpRequestResponse response = BurpExtender.getCallbacks().makeHttpRequest(service, request);
+            long responseTime = System.currentTimeMillis() - startTime;
+            
             if (response == null) {
+                recordFailure(hostKey);
+                if (retryCount < MAX_RETRIES) {
+                    int delayMs = calculateRetryDelay(retryCount);
+                    try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
+                    return retrieveResponseDetails(service, request, retryCount + 1);
+                }
                 return null;
             }
 
@@ -335,23 +398,101 @@ class RequestSender {
             Map<String, Object> details = new HashMap<>();
             details.put("statusCode", (int) responseInfo.getStatusCode());
             details.put("headers", responseInfo.getHeaders());
+            details.put("responseTime", responseTime);
 
             byte[] responseBody = java.util.Arrays.copyOfRange(response.getResponse(),
                 responseInfo.getBodyOffset(), response.getResponse().length);
             details.put("body", responseBody);
 
-            // Thread-safe cache insertion
-            synchronized (CACHE_LOCK) {
+            // Cache successful responses
+            if (responseInfo.getStatusCode() >= 200 && responseInfo.getStatusCode() < 500) {
                 RESPONSE_CACHE.put(cacheKey, details);
+                recordSuccess(hostKey, responseTime);
+            } else {
+                recordFailure(hostKey);
             }
+            
             return details;
         } catch (Exception e) {
+            String hostKey = service.getHost();
+            recordFailure(hostKey);
+            if (retryCount < MAX_RETRIES) {
+                int delayMs = calculateRetryDelay(retryCount);
+                try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
+                return retrieveResponseDetails(service, request, retryCount + 1);
+            }
             return null;
         }
+    }
+    
+    private static boolean isCircuitOpen(String hostKey) {
+        AtomicInteger failures = FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0));
+        if (failures.get() >= CIRCUIT_BREAKER_THRESHOLD) {
+            AtomicLong lastFailure = LAST_REQUEST_TIME.get(hostKey);
+            if (lastFailure == null) {
+                // No failure time recorded yet, circuit should not be open
+                return false;
+            }
+            long timeSinceLastFailure = System.currentTimeMillis() - lastFailure.get();
+            if (timeSinceLastFailure < CIRCUIT_BREAKER_RESET_MS) {
+                return true;
+            } else {
+                // Reset circuit breaker after reset period has elapsed
+                failures.set(0);
+            }
+        }
+        return false;
+    }
+    
+    private static boolean checkRateLimit(String hostKey) {
+        AtomicInteger count = REQUEST_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0));
+        AtomicLong lastTime = LAST_REQUEST_TIME.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis()));
+        
+        long currentTime = System.currentTimeMillis();
+        long timeDiff = currentTime - lastTime.get();
+        
+        if (timeDiff >= 1000) {
+            // Reset counter every second
+            count.set(0);
+            lastTime.set(currentTime);
+        }
+        
+        if (count.get() >= MAX_REQUESTS_PER_SECOND) {
+            return false;
+        }
+        
+        count.incrementAndGet();
+        return true;
+    }
+    
+    private static long calculateAdaptiveDelay(String hostKey) {
+        // Start with base delay, adjust based on response times
+        AtomicLong lastTime = LAST_REQUEST_TIME.get(hostKey);
+        if (lastTime == null) {
+            return 50; // Base delay
+        }
+        // Could be enhanced to track average response times
+        return 50;
+    }
+    
+    private static int calculateRetryDelay(int retryCount) {
+        // Exponential backoff
+        int delay = MIN_RETRY_DELAY_MS * (1 << retryCount);
+        return Math.min(delay, MAX_RETRY_DELAY_MS);
+    }
+    
+    private static void recordSuccess(String hostKey, long responseTime) {
+        FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0)).set(0);
+    }
+    
+    private static void recordFailure(String hostKey) {
+        FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0)).incrementAndGet();
+        LAST_REQUEST_TIME.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis())).set(System.currentTimeMillis());
     }
 
     /**
      * Cleans response body by removing common dynamic elements.
+     * Enhanced with additional patterns for better similarity detection.
      */
     private static String cleanResponseBody(String body) {
         if (body == null) return "";
@@ -359,7 +500,14 @@ class RequestSender {
         body = HTML_COMMENT_PATTERN.matcher(body).replaceAll("");
         // Remove common CSRF hidden input tags
         body = CSRF_TOKEN_PATTERN.matcher(body).replaceAll("");
-        // Add more cleaning rules if needed (e.g., script tags, specific divs)
+        // Remove timestamps
+        body = TIMESTAMP_PATTERN.matcher(body).replaceAll("");
+        // Remove session IDs
+        body = SESSION_ID_PATTERN.matcher(body).replaceAll("");
+        // Remove UUIDs
+        body = UUID_PATTERN.matcher(body).replaceAll("");
+        // Remove script tags with dynamic content
+        body = Pattern.compile("<script[^>]*>.*?</script>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(body).replaceAll("");
         return body;
     }
 
@@ -837,5 +985,245 @@ class RequestSender {
         }
         
         return secondReqOk && cacheHitDetected;
+    }
+    
+    /**
+     * Detects CDN/cache provider from response headers.
+     * Returns the detected CDN name or null if not detected.
+     */
+    protected static String detectCDN(List<String> headers) {
+        if (headers == null) return null;
+        
+        String headerStr = String.join("\n", headers).toLowerCase();
+        for (Map.Entry<String, String[]> entry : CDN_PATTERNS.entrySet()) {
+            String cdnName = entry.getKey();
+            String[] patterns = entry.getValue();
+            for (String pattern : patterns) {
+                if (headerStr.contains(pattern.toLowerCase())) {
+                    return cdnName;
+                }
+            }
+        }
+        return null;
+    }
+    
+    /**
+     * Tests header-based cache key attacks.
+     * Tests if modifying cache-related headers causes cache confusion.
+     */
+    protected static boolean testHeaderBasedCacheKey(IHttpRequestResponse message, String headerName, String headerValue) {
+        byte[] originalRequest = buildHttpRequest(message, null, null, true);
+        Map<String, Object> originalDetails = retrieveResponseDetails(message.getHttpService(), originalRequest);
+        if (originalDetails == null) return false;
+        byte[] originalBody = (byte[]) originalDetails.get("body");
+        
+        byte[] modifiedRequest = buildHttpRequestWithHeader(message, true, headerName, headerValue);
+        if (modifiedRequest == null) return false;
+        
+        Map<String, Object> modifiedDetails = retrieveResponseDetails(message.getHttpService(), modifiedRequest);
+        if (modifiedDetails == null) return false;
+        
+        // Test unauthenticated request with same header
+        byte[] unauthRequest = buildHttpRequestWithHeader(message, false, headerName, headerValue);
+        if (unauthRequest == null) return false;
+        
+        Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
+        if (unauthDetails == null) return false;
+        
+        Map<String, Object> similarity = testSimilar(new String(originalBody), new String((byte[]) unauthDetails.get("body")));
+        return (boolean) similarity.get("similar");
+    }
+    
+    /**
+     * Builds HTTP request with modified header.
+     */
+    private static byte[] buildHttpRequestWithHeader(IHttpRequestResponse reqRes, boolean addCookies, String headerName, String headerValue) {
+        IRequestInfo reqInfo = BurpExtender.getHelpers().analyzeRequest(reqRes);
+        List<String> headers = reqInfo.getHeaders();
+        
+        List<String> newHeaders = new ArrayList<>();
+        boolean headerAdded = false;
+        
+        for (String header : headers) {
+            if (header.toLowerCase().startsWith(headerName.toLowerCase() + ":")) {
+                newHeaders.add(headerName + ": " + headerValue);
+                headerAdded = true;
+            } else if (!addCookies && header.toLowerCase().startsWith("cookie:")) {
+                continue;
+            } else {
+                newHeaders.add(header);
+            }
+        }
+        
+        if (!headerAdded) {
+            newHeaders.add(headerName + ": " + headerValue);
+        }
+        
+        byte[] body = null;
+        if (reqRes.getRequest() != null && reqInfo.getBodyOffset() < reqRes.getRequest().length) {
+            body = java.util.Arrays.copyOfRange(reqRes.getRequest(), reqInfo.getBodyOffset(), reqRes.getRequest().length);
+        }
+        
+        return BurpExtender.getHelpers().buildHttpMessage(newHeaders, body);
+    }
+    
+    /**
+     * Tests HTTP Parameter Pollution (HPP) for cache key confusion.
+     */
+    protected static boolean testHPPCacheKey(IHttpRequestResponse message, String paramName) {
+        IRequestInfo reqInfo = BurpExtender.getHelpers().analyzeRequest(message);
+        URL url = reqInfo.getUrl();
+        
+        // Build request with duplicate parameter
+        String query = url.getQuery() != null ? url.getQuery() : "";
+        String newQuery = query.isEmpty() ? paramName + "=value1&" + paramName + "=value2" : query + "&" + paramName + "=value1&" + paramName + "=value2";
+        
+        try {
+            URL newUrl = new URL(url.getProtocol(), url.getHost(), url.getPort(), url.getPath() + "?" + newQuery);
+            byte[] authRequest = BurpExtender.getHelpers().buildHttpRequest(newUrl);
+            
+            // Add cookies if needed
+            if (reqInfo.getMethod().equals("GET")) {
+                List<IParameter> params = reqInfo.getParameters();
+                for (IParameter p : params) {
+                    if (IParameter.PARAM_COOKIE == p.getType()) {
+                        authRequest = BurpExtender.getHelpers().addParameter(authRequest, p);
+                    }
+                }
+            }
+            
+            Map<String, Object> authDetails = retrieveResponseDetails(message.getHttpService(), authRequest);
+            if (authDetails == null) return false;
+            byte[] authBody = (byte[]) authDetails.get("body");
+            
+            // Test without auth
+            byte[] unauthRequest = BurpExtender.getHelpers().buildHttpRequest(newUrl);
+            Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
+            if (unauthDetails == null) return false;
+            byte[] unauthBody = (byte[]) unauthDetails.get("body");
+            
+            Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
+            return (boolean) similarity.get("similar");
+        } catch (MalformedURLException e) {
+            return false;
+        }
+    }
+    
+    /**
+     * Tests case sensitivity attacks - mixed case paths that may normalize differently.
+     */
+    protected static boolean testCaseSensitivityAttack(IHttpRequestResponse message, String delimiter, String extension) {
+        String targetPath = BurpExtender.getHelpers().analyzeRequest(message).getUrl().getPath();
+        String randomSegment = generateRandomString(5);
+        
+        // Test with mixed case
+        String mixedCasePath = targetPath + delimiter + randomSegment.toUpperCase() + "." + extension;
+        byte[] authRequest = buildHttpRequestWithFullPath(message, true, mixedCasePath);
+        if (authRequest == null) return false;
+        
+        Map<String, Object> authDetails = retrieveResponseDetails(message.getHttpService(), authRequest);
+        if (authDetails == null) return false;
+        byte[] authBody = (byte[]) authDetails.get("body");
+        
+        // Test lowercase version without auth
+        String lowerCasePath = targetPath + delimiter + randomSegment.toLowerCase() + "." + extension;
+        byte[] unauthRequest = buildHttpRequestWithFullPath(message, false, lowerCasePath);
+        if (unauthRequest == null) return false;
+        
+        Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
+        if (unauthDetails == null) return false;
+        byte[] unauthBody = (byte[]) unauthDetails.get("body");
+        
+        Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
+        return (boolean) similarity.get("similar");
+    }
+    
+    /**
+     * Tests unicode normalization attacks.
+     */
+    protected static boolean testUnicodeNormalization(IHttpRequestResponse message, String delimiter) {
+        String targetPath = BurpExtender.getHelpers().analyzeRequest(message).getUrl().getPath();
+        
+        // Test with unicode variations
+        String unicodePath = targetPath + delimiter + "test\u00e9.css"; // é in unicode
+        byte[] authRequest = buildHttpRequestWithFullPath(message, true, unicodePath);
+        if (authRequest == null) return false;
+        
+        Map<String, Object> authDetails = retrieveResponseDetails(message.getHttpService(), authRequest);
+        if (authDetails == null) return false;
+        byte[] authBody = (byte[]) authDetails.get("body");
+        
+        // Test ASCII equivalent without auth
+        String asciiPath = targetPath + delimiter + "teste.css";
+        byte[] unauthRequest = buildHttpRequestWithFullPath(message, false, asciiPath);
+        if (unauthRequest == null) return false;
+        
+        Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
+        if (unauthDetails == null) return false;
+        byte[] unauthBody = (byte[]) unauthDetails.get("body");
+        
+        Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
+        return (boolean) similarity.get("similar");
+    }
+    
+    /**
+     * Multi-round verification - confirms cache hits with 3+ requests.
+     * Returns confidence level: "High", "Medium", or "Low".
+     */
+    protected static String multiRoundVerification(IHttpRequestResponse message, byte[] testRequest, int rounds) {
+        if (rounds < 2) rounds = 3; // Minimum 3 rounds
+        
+        byte[] originalAuthRequest = buildHttpRequest(message, null, null, true);
+        Map<String, Object> originalDetails = retrieveResponseDetails(message.getHttpService(), originalAuthRequest);
+        if (originalDetails == null) return "Low";
+        byte[] originalBody = (byte[]) originalDetails.get("body");
+        
+        int cacheHits = 0;
+        int similarResponses = 0;
+        
+        for (int i = 0; i < rounds; i++) {
+            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+            
+            Map<String, Object> details = retrieveResponseDetails(message.getHttpService(), testRequest);
+            if (details == null) continue;
+            
+            @SuppressWarnings("unchecked")
+            List<String> headers = (List<String>) details.get("headers");
+            String xCacheHeader = getHeaderValue(headers, "X-Cache");
+            if (xCacheHeader != null && xCacheHeader.toLowerCase().contains("hit")) {
+                cacheHits++;
+            }
+            
+            byte[] body = (byte[]) details.get("body");
+            Map<String, Object> similarity = testSimilar(new String(originalBody), new String(body));
+            if ((boolean) similarity.get("similar")) {
+                similarResponses++;
+            }
+        }
+        
+        if (cacheHits >= rounds - 1 && similarResponses >= rounds - 1) {
+            return "High";
+        } else if (cacheHits >= rounds / 2 && similarResponses >= rounds / 2) {
+            return "Medium";
+        } else {
+            return "Low";
+        }
+    }
+    
+    /**
+     * Enhanced similarity test with early termination for large responses.
+     */
+    protected static Map<String, Object> testSimilarOptimized(String firstString, String secondString) {
+        // Early termination for very different sizes
+        int sizeDiff = Math.abs(firstString.length() - secondString.length());
+        if (sizeDiff > firstString.length() * 0.5) {
+            Map<String, Object> results = new HashMap<>();
+            results.put("similar", false);
+            results.put("jaro", 0.0);
+            results.put("levenshtein", Integer.MAX_VALUE);
+            return results;
+        }
+        
+        return testSimilar(firstString, secondString);
     }
 }

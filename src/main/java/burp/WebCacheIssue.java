@@ -7,6 +7,8 @@ public class WebCacheIssue implements IScanIssue {
 
     private IHttpRequestResponse message;
     private Set<String> extensions;
+    private String confidence = "Tentative";
+    private String exploitPoC = null;
 
     WebCacheIssue(IHttpRequestResponse message) {
         this.message = message;
@@ -14,6 +16,14 @@ public class WebCacheIssue implements IScanIssue {
 
     void setVulnerableExtensions(Set<String> extensions) {
         this.extensions = extensions;
+    }
+    
+    void setConfidence(String confidence) {
+        this.confidence = confidence;
+    }
+    
+    void setExploitPoC(String poc) {
+        this.exploitPoC = poc;
     }
 
     @Override
@@ -38,7 +48,7 @@ public class WebCacheIssue implements IScanIssue {
 
     @Override
     public String getConfidence() {
-        return "Tentative";
+        return confidence;
     }
 
     @Override
@@ -64,11 +74,23 @@ public class WebCacheIssue implements IScanIssue {
             sb.append("<ul>");
             URL url = getUrl();
             String baseUrl = url.toExternalForm();
+            if (baseUrl.contains("?")) {
+                baseUrl = baseUrl.substring(0, baseUrl.indexOf("?"));
+            }
             for (String ext : extensions) {
-                sb.append("<li>").append(baseUrl).append("/test.").append(ext).append("</li>");
+                String exploitUrl = baseUrl + "/test." + ext;
+                sb.append("<li>").append(exploitUrl).append("</li>");
+                sb.append("<pre>curl -v \"").append(exploitUrl).append("\"</pre>");
             }
             sb.append("</ul>");
         }
+        
+        if (exploitPoC != null && !exploitPoC.isEmpty()) {
+            sb.append("<br/><strong>Proof of Concept:</strong><br/>");
+            sb.append("<pre>").append(exploitPoC).append("</pre>");
+        }
+        
+        sb.append("<br/><strong>Confidence Level:</strong> ").append(confidence);
         
         return sb.toString();
     }

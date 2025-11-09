@@ -6,6 +6,7 @@ import java.awt.event.ActionListener;
 import java.io.PrintStream;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * @author J Snyman
@@ -14,11 +15,12 @@ import java.util.concurrent.*;
  */
 public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtensionStateListener {
 
-    private final static float VERSION = 1.4f;
+    private final static float VERSION = 2.0f;
 
     private static IBurpExtenderCallbacks callbacks;
     private static IExtensionHelpers helpers;
-    private static ExecutorService executor;
+    private static ForkJoinPool executor;
+    private static final AtomicLong scanStartTime = new AtomicLong(0);
 
     protected static IExtensionHelpers getHelpers() {
         return helpers;
@@ -39,6 +41,26 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
     protected static void printStatus(String status) {
         callbacks.printOutput("[WCD] " + status);
     }
+    
+    protected static void logDebug(String message) {
+        callbacks.printOutput("[WCD] [DEBUG] " + message);
+    }
+    
+    protected static void logInfo(String message) {
+        callbacks.printOutput("[WCD] [INFO] " + message);
+    }
+    
+    protected static void logWarning(String message) {
+        callbacks.printOutput("[WCD] [WARNING] " + message);
+    }
+    
+    protected static void logError(String message) {
+        callbacks.printOutput("[WCD] [ERROR] " + message);
+    }
+    
+    protected static void logTiming(String phase, long durationMs) {
+        callbacks.printOutput(String.format("[WCD] [TIMING] %s: %d ms", phase, durationMs));
+    }
 
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks iBurpExtenderCallbacks) {
@@ -50,8 +72,9 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
         helpers = iBurpExtenderCallbacks.getHelpers();
 
-        int threads = Math.max(2, Runtime.getRuntime().availableProcessors());
-        executor = Executors.newFixedThreadPool(threads);
+        int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
+        executor = new ForkJoinPool(parallelism, ForkJoinPool.defaultForkJoinWorkerThreadFactory, null, true);
+        logInfo("Version " + VERSION + " loaded with parallelism: " + parallelism);
     }
 
 
@@ -59,9 +82,9 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
         synchronized (this) {
             if (executor != null && !executor.isShutdown()) {
                 try {
-                    executor.submit(new ScannerThread(iHttpRequestResponse));
+                    executor.execute(new ScannerThread(iHttpRequestResponse));
                 } catch (RejectedExecutionException e) {
-                    print("Executor unavailable, falling back to new thread: " + e.getMessage());
+                    logWarning("Executor unavailable, falling back to new thread: " + e.getMessage());
                     new Thread(new ScannerThread(iHttpRequestResponse)).start();
                 }
             } else {
@@ -110,14 +133,33 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
         @Override
         public void run() {
+            long scanStart = System.currentTimeMillis();
+            scanStartTime.set(scanStart);
             try {
                 String targetUrlStr = helpers.analyzeRequest(reqRes).getUrl().toString();
-                printStatus("Starting scan: " + targetUrlStr);
+                logInfo("Starting scan: " + targetUrlStr);
                 
                 updateStatus("Initializing...");
+                long initStart = System.currentTimeMillis();
                 if (!RequestSender.initialTest(reqRes)) {
-                    printStatus("Scan aborted: Initial path mapping tests failed");
+                    logWarning("Scan aborted: Initial path mapping tests failed");
                     return;
+                }
+                logTiming("Initialization", System.currentTimeMillis() - initStart);
+                
+                // Detect CDN/cache layer
+                byte[] testRequest = RequestSender.buildHttpRequest(reqRes, null, null, true);
+                Map<String, Object> testDetails = RequestSender.retrieveResponseDetails(reqRes.getHttpService(), testRequest);
+                String detectedCDN = null;
+                if (testDetails != null) {
+                    @SuppressWarnings("unchecked")
+                    List<String> headers = (List<String>) testDetails.get("headers");
+                    if (headers != null) {
+                        detectedCDN = RequestSender.detectCDN(headers);
+                        if (detectedCDN != null) {
+                            logInfo("Detected CDN/Cache: " + detectedCDN);
+                        }
+                    }
                 }
 
                 String randomSegment = reqRes.getComment();
@@ -131,6 +173,10 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 Map<String, String> successfulRelativeExploits = new HashMap<>();
                 Map<String, String> successfulReverseTraversals = new HashMap<>();
                 Map<String, Map<String, String>> successfulSelfRefExploits = new HashMap<>();
+                Map<String, String> successfulHeaderAttacks = new HashMap<>();
+                Map<String, String> successfulHPPAttacks = new HashMap<>();
+                Map<String, String> successfulCaseAttacks = new HashMap<>();
+                Map<String, String> successfulUnicodeAttacks = new HashMap<>();
                 boolean hashTraversalVulnerable = false;
                 String successfulTraversalPath = null;
 
@@ -139,7 +185,8 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     "resources/", "static/", "css/", "js/", "images/", "public/", "assets/",
                     "api/", "media/", "uploads/", "content/", "files/", "data/"
                 );
-                List<String> delimiters = Arrays.asList("?", "%3f", "%23", ";", "/", ".", ",", "@");
+                // Use advanced delimiters
+                List<String> delimiters = Arrays.asList(RequestSender.ADVANCED_DELIMITERS);
                 
                 for (String delimiter : delimiters) {
                     Map<String, String> successfulSegmentsForDelimiter = new HashMap<>();
@@ -177,11 +224,46 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 List<String> allExtensions = new ArrayList<>(Arrays.asList(RequestSender.INITIAL_TEST_EXTENSIONS));
                 allExtensions.addAll(Arrays.asList(RequestSender.OTHER_TEST_EXTENSIONS));
 
-                for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
+                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
                     for (String extension : allExtensions) {
                         if (RequestSender.testDelimiterExtension(reqRes, randomSegment, extension, delimiter)) {
                             vulnerableDelimiterCombinations.computeIfAbsent(delimiter, k -> new HashSet<>()).add(extension);
                         }
+                    }
+                }
+                
+                updateStatus("Testing header-based cache key attacks...");
+                for (String header : RequestSender.CACHE_KEY_HEADERS) {
+                    if (RequestSender.testHeaderBasedCacheKey(reqRes, header, "evil.com")) {
+                        successfulHeaderAttacks.put(header, "evil.com");
+                    }
+                }
+                
+                updateStatus("Testing HTTP Parameter Pollution...");
+                IRequestInfo reqInfo = helpers.analyzeRequest(reqRes);
+                List<IParameter> params = reqInfo.getParameters();
+                for (IParameter param : params) {
+                    if (param.getType() == IParameter.PARAM_URL) {
+                        if (RequestSender.testHPPCacheKey(reqRes, param.getName())) {
+                            successfulHPPAttacks.put(param.getName(), "HPP");
+                        }
+                    }
+                }
+                
+                updateStatus("Testing case sensitivity attacks...");
+                for (String delimiter : Arrays.asList("/", ";", "?")) {
+                    for (String ext : Arrays.asList("css", "js", "html")) {
+                        if (RequestSender.testCaseSensitivityAttack(reqRes, delimiter, ext)) {
+                            successfulCaseAttacks.put(delimiter, ext);
+                            break;
+                        }
+                    }
+                }
+                
+                updateStatus("Testing unicode normalization...");
+                for (String delimiter : Arrays.asList("/", ";", "?")) {
+                    if (RequestSender.testUnicodeNormalization(reqRes, delimiter)) {
+                        successfulUnicodeAttacks.put(delimiter, "unicode");
                     }
                 }
 
@@ -189,7 +271,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 List<String> knownPaths = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PATHS);
                 List<String> normalizationTemplates = Arrays.asList(RequestSender.NORMALIZATION_TEMPLATES);
                 
-                for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
+                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
                     Map<String, String> successfulPathsForDelimiter = new HashMap<>();
                     for (String knownPath : knownPaths) {
                         for (String template : normalizationTemplates) {
@@ -205,7 +287,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
                 updateStatus("Testing relative normalization...");
                 String specificRelativePath = "%2f%2e%2e%2frobots.txt";
-                for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
+                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
                     if (RequestSender.testRelativeNormalizationExploit(reqRes, delimiter, specificRelativePath)) {
                         successfulRelativeExploits.put(delimiter, specificRelativePath);
                     }
@@ -213,7 +295,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
                 updateStatus("Testing prefix normalization...");
                 List<String> knownPrefixes = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PREFIXES);
-                for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
+                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
                     for (String prefix : knownPrefixes) {
                         if (RequestSender.testPrefixNormalizationExploit(reqRes, delimiter, prefix)) {
                             successfulPrefixExploits.put(delimiter, prefix);
@@ -239,7 +321,14 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                                 !successfulNormalizationDetails.isEmpty() ||
                                 !successfulPrefixExploits.isEmpty() ||
                                 !successfulRelativeExploits.isEmpty() ||
-                                !successfulReverseTraversals.isEmpty();
+                                !successfulReverseTraversals.isEmpty() ||
+                                !successfulHeaderAttacks.isEmpty() ||
+                                !successfulHPPAttacks.isEmpty() ||
+                                !successfulCaseAttacks.isEmpty() ||
+                                !successfulUnicodeAttacks.isEmpty();
+                
+                long scanDuration = System.currentTimeMillis() - scanStart;
+                logTiming("Total scan duration", scanDuration);
 
                 if (anyHits) {
                     WebCacheIssue issue = new WebCacheIssue(reqRes);
@@ -251,19 +340,21 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                         issue.setVulnerableExtensions(allVulnerableExtensions);
                     }
                     
-                    printStatus("VULNERABILITY FOUND: " + targetUrlStr);
+                    logInfo("VULNERABILITY FOUND: " + targetUrlStr);
                     generateExploitDetails(reqRes, successfulSelfRefExploits, hashTraversalVulnerable, 
                                          successfulTraversalPath, vulnerableDelimiterCombinations, 
                                          successfulNormalizationDetails, successfulPrefixExploits, 
-                                         successfulRelativeExploits, successfulReverseTraversals);
+                                         successfulRelativeExploits, successfulReverseTraversals,
+                                         successfulHeaderAttacks, successfulHPPAttacks,
+                                         successfulCaseAttacks, successfulUnicodeAttacks, detectedCDN);
                     
                     callbacks.addScanIssue(issue);
                 } else {
-                    printStatus("No vulnerabilities found: " + targetUrlStr);
+                    logInfo("No vulnerabilities found: " + targetUrlStr);
                 }
 
             } catch (Throwable t) {
-                printStatus("ERROR: " + t.getMessage());
+                logError("ERROR: " + t.getMessage());
                 t.printStackTrace(new PrintStream(callbacks.getStderr()));
             }
         }
@@ -275,7 +366,12 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                                           Map<String, Map<String, String>> successfulNormalizationDetails,
                                           Map<String, String> successfulPrefixExploits,
                                           Map<String, String> successfulRelativeExploits,
-                                          Map<String, String> successfulReverseTraversals) {
+                                          Map<String, String> successfulReverseTraversals,
+                                          Map<String, String> successfulHeaderAttacks,
+                                          Map<String, String> successfulHPPAttacks,
+                                          Map<String, String> successfulCaseAttacks,
+                                          Map<String, String> successfulUnicodeAttacks,
+                                          String detectedCDN) {
             
             String baseUrl = helpers.analyzeRequest(reqRes).getUrl().toString();
             if (baseUrl.contains("?")) {
@@ -284,6 +380,10 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
             
             int exploitCount = 0;
             StringBuilder summary = new StringBuilder();
+            
+            if (detectedCDN != null) {
+                summary.append(String.format("[INFO] Detected CDN/Cache: %s\n", detectedCDN));
+            }
             
             // Self-Referential Normalization Exploits
             if (!successfulSelfRefExploits.isEmpty()) {
@@ -341,8 +441,36 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 exploitCount++;
             }
             
+            // Header-based attacks
+            if (!successfulHeaderAttacks.isEmpty()) {
+                Map.Entry<String, String> entry = successfulHeaderAttacks.entrySet().iterator().next();
+                summary.append(String.format("[HIGH] Header Attack: %s: %s\n", entry.getKey(), entry.getValue()));
+                exploitCount++;
+            }
+            
+            // HPP attacks
+            if (!successfulHPPAttacks.isEmpty()) {
+                Map.Entry<String, String> entry = successfulHPPAttacks.entrySet().iterator().next();
+                summary.append(String.format("[MEDIUM] HPP Attack: Parameter %s\n", entry.getKey()));
+                exploitCount++;
+            }
+            
+            // Case sensitivity attacks
+            if (!successfulCaseAttacks.isEmpty()) {
+                Map.Entry<String, String> entry = successfulCaseAttacks.entrySet().iterator().next();
+                summary.append(String.format("[MEDIUM] Case Sensitivity: %s with %s\n", entry.getKey(), entry.getValue()));
+                exploitCount++;
+            }
+            
+            // Unicode attacks
+            if (!successfulUnicodeAttacks.isEmpty()) {
+                Map.Entry<String, String> entry = successfulUnicodeAttacks.entrySet().iterator().next();
+                summary.append(String.format("[MEDIUM] Unicode Normalization: %s\n", entry.getKey()));
+                exploitCount++;
+            }
+            
             if (exploitCount > 0) {
-                printStatus(String.format("Found %d exploit(s):", exploitCount));
+                logInfo(String.format("Found %d exploit(s):", exploitCount));
                 print(summary.toString());
             }
         }
@@ -369,13 +497,15 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
     public void extensionUnloaded() {
         synchronized (this) {
             if (executor != null && !executor.isShutdown()) {
-                executor.shutdownNow();
+                executor.shutdown();
                 try {
-                    // Wait a bit for tasks to complete
-                    if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
-                        print("Some scanning tasks may not have completed cleanly");
+                    // Wait for tasks to complete
+                    if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                        executor.shutdownNow();
+                        logWarning("Some scanning tasks may not have completed cleanly");
                     }
                 } catch (InterruptedException e) {
+                    executor.shutdownNow();
                     Thread.currentThread().interrupt();
                 }
             }
