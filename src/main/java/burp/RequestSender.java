@@ -25,8 +25,11 @@ import java.util.concurrent.atomic.AtomicLong;
 
 class RequestSender {
 
-    private final static double   JARO_THRESHOLD = 0.8;
-    private final static int      LEVENSHTEIN_THRESHOLD = 200;
+    // Similarity thresholds - tuned to catch real vulnerabilities while reducing false positives
+    // Jaro-Winkler: 0.75 = 75% similarity (lowered from 0.8 to catch more real cases)
+    // Levenshtein: 300 = max edit distance (raised from 200 to account for dynamic content)
+    private final static double   JARO_THRESHOLD = 0.75;
+    private final static int      LEVENSHTEIN_THRESHOLD = 300;
     private final static int      CACHE_MAX_SIZE = 1000; // Maximum cache entries
     private final static int      CACHE_TTL_SECONDS = 300; // 5 minutes TTL
     private final static int      MAX_RETRIES = 3;
@@ -119,7 +122,11 @@ class RequestSender {
     private static final Pattern UUID_PATTERN = Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", Pattern.CASE_INSENSITIVE);
 
     /**
-     * Initial test to check if the application ignores trailing path segments
+     * Initial test to check if the application ignores trailing path segments.
+     * This is a prerequisite for cache deception - the backend must ignore trailing segments.
+     * Returns true only if:
+     * 1. Authenticated and unauthenticated responses are DIFFERENT (confirms auth is required)
+     * 2. Authenticated response with appended segment is SIMILAR to original (confirms backend ignores trailing segments)
      */
     protected static boolean initialTest(IHttpRequestResponse message) {
         byte[] orgRequest = buildHttpRequest(message, null, null, true);
@@ -127,43 +134,76 @@ class RequestSender {
         if (orgDetails == null) {
             return false;
         }
+        int orgStatusCode = (int) orgDetails.get("statusCode");
+        if (orgStatusCode < 200 || orgStatusCode >= 300) {
+            return false; // Original request must succeed
+        }
         byte[] originalAuthBody = (byte[]) orgDetails.get("body");
 
+        // Step 1: Verify authenticated and unauthenticated responses are DIFFERENT
+        // This confirms the endpoint requires authentication
         byte[] unAuthedRequest = buildHttpRequest(message, null, null, false);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unAuthedRequest);
         if (unauthDetails == null) {
             return false; 
         }
+        int unauthStatusCode = (int) unauthDetails.get("statusCode");
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
 
         Map<String, Object> step1Similarity = testSimilar(new String(originalAuthBody), new String(unauthBody));
         boolean unauthedIsSimilar = (boolean) step1Similarity.get("similar");
 
+        // If unauthenticated response is similar, this endpoint doesn't require auth - skip it
         if (unauthedIsSimilar) {
+            BurpExtender.logDebug("Initial test failed: Unauthenticated response similar to authenticated");
             return false;
         }
 
+        // Step 2: Verify that appending a random segment returns SIMILAR content
+        // This confirms the backend ignores trailing path segments (prerequisite for cache deception)
         String randomSegment = generateRandomString(5);
         byte[] testRequest = buildHttpRequestWithSegment(message, randomSegment, null, true, "/");
         Map<String, Object> appendedDetails = retrieveResponseDetails(message.getHttpService(), testRequest);
         if (appendedDetails == null) {
             return false;
         }
+        int appendedStatusCode = (int) appendedDetails.get("statusCode");
+        if (appendedStatusCode < 200 || appendedStatusCode >= 300) {
+            return false; // Appended request must also succeed
+        }
         byte[] appendedBody = (byte[]) appendedDetails.get("body");
 
         Map<String, Object> step2Similarity = testSimilar(new String(originalAuthBody), new String(appendedBody));
         boolean appendIsSimilar = (boolean) step2Similarity.get("similar");
 
+        if (!appendIsSimilar) {
+            BurpExtender.logDebug("Initial test failed: Appended segment response not similar to original");
+            return false;
+        }
+
+        // Both conditions met: auth required AND backend ignores trailing segments
         message.setComment(randomSegment);
         return true;
     }
 
     /**
      * Tests if appending a specific delimiter, segment, and extension leads to caching.
-     * Now with status code validation to prevent false positives.
+     * Verification steps:
+     * 1. Request with auth -> get authenticated response
+     * 2. Request without auth -> if similar to authenticated response, cache deception confirmed
+     * 3. Also verify the unauthenticated response matches the ORIGINAL authenticated endpoint
+     *    to ensure we're not just caching a different static resource
      */
     protected static boolean testDelimiterExtension(IHttpRequestResponse message, String randomSegment, String ext, String delimiter) {
-        // Get Auth Response Details
+        // Get original authenticated response for comparison
+        byte[] originalAuthRequest = buildHttpRequest(message, null, null, true);
+        Map<String, Object> originalAuthDetails = retrieveResponseDetails(message.getHttpService(), originalAuthRequest);
+        if (originalAuthDetails == null) {
+            return false;
+        }
+        byte[] originalAuthBody = (byte[]) originalAuthDetails.get("body");
+        
+        // Get Auth Response Details with crafted URL
         byte[] authRequest = buildHttpRequestWithSegment(message, randomSegment, ext, true, delimiter);
         Map<String, Object> authDetails = retrieveResponseDetails(message.getHttpService(), authRequest);
         if (authDetails == null) {
@@ -176,6 +216,13 @@ class RequestSender {
             return false;
         }
 
+        // Verify crafted URL returns similar content to original (backend ignores trailing segments)
+        Map<String, Object> craftedSimilarity = testSimilar(new String(originalAuthBody), new String(authBody));
+        if (!(boolean) craftedSimilarity.get("similar")) {
+            return false; // Crafted URL must return similar content to original
+        }
+
+        // Now test without authentication - this is the cache deception check
         byte[] unauthRequest = buildHttpRequestWithSegment(message, randomSegment, ext, false, delimiter);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
         if (unauthDetails == null) {
@@ -188,8 +235,17 @@ class RequestSender {
             return false;
         }
 
+        // Check 1: Unauthenticated response should be similar to authenticated crafted response
         Map<String, Object> similarityResult = testSimilar(new String(authBody), new String(unauthBody));
-        return (boolean) similarityResult.get("similar");
+        boolean similarToCrafted = (boolean) similarityResult.get("similar");
+        
+        // Check 2: Unauthenticated response should also be similar to ORIGINAL authenticated endpoint
+        // This confirms we're caching the sensitive content, not just a static file
+        Map<String, Object> originalSimilarity = testSimilar(new String(originalAuthBody), new String(unauthBody));
+        boolean similarToOriginal = (boolean) originalSimilarity.get("similar");
+        
+        // Both checks must pass for a confirmed vulnerability
+        return similarToCrafted && similarToOriginal;
     }
 
     /**

@@ -3,6 +3,8 @@ name: Build Extension
 on:
   push:
     branches: [ main, master ]
+    tags:
+      - 'v*'
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
@@ -14,6 +16,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
       
     - name: Set up JDK 11
       uses: actions/setup-java@v4
@@ -27,10 +31,46 @@ jobs:
     - name: Build with Gradle
       run: ./gradlew clean build
       
+    - name: Get version from build.gradle
+      id: get_version
+      run: |
+        VERSION=$(grep "Implementation-Version" build.gradle | sed "s/.*'\(.*\)'.*/\1/")
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+      
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: extension-jar
         path: build/libs/*.jar
         retention-days: 30
+    
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: build/libs/*.jar
+        name: Release v${{ steps.get_version.outputs.version }}
+        body: |
+          ## Web Cache Deception Scanner v${{ steps.get_version.outputs.version }}
+          
+          ### Changes
+          - See commit history for details
+          
+          ### Installation
+          1. Download the `web-cache-deception-scanner-all.jar` file
+          2. In Burp Suite, go to **Extender** tab
+          3. Click **Add** and select the JAR file
+          4. Check the **Output** tab for loading confirmation
+          
+          ### Features
+          - Advanced cache deception detection
+          - Multiple attack vectors (delimiters, headers, HPP, unicode, case sensitivity)
+          - CDN fingerprinting
+          - High-performance caching with Caffeine
+          - Circuit breaker and rate limiting
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
