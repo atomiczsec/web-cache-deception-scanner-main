@@ -10,6 +10,7 @@ import java.util.concurrent.*;
 /**
  * @author J Snyman
  * @author T Secker
+ * @author atomiczsec
  */
 public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtensionStateListener {
 
@@ -32,7 +33,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
     }
     
     protected static void updateStatus(String status) {
-        // Update status bar (overwrite previous line)
         callbacks.printOutput("\r[WCD] " + status);
     }
     
@@ -54,21 +54,17 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
         executor = Executors.newFixedThreadPool(threads);
     }
 
-    // Submit the scanning job to a shared thread pool so multiple requests can
-    // be processed concurrently without spawning excessive threads.
+
     private void runScannerForRequest(IHttpRequestResponse iHttpRequestResponse) {
-        // Synchronize to prevent race conditions during executor shutdown
         synchronized (this) {
             if (executor != null && !executor.isShutdown()) {
                 try {
                     executor.submit(new ScannerThread(iHttpRequestResponse));
                 } catch (RejectedExecutionException e) {
-                    // Fallback if executor was shut down between check and submit
                     print("Executor unavailable, falling back to new thread: " + e.getMessage());
                     new Thread(new ScannerThread(iHttpRequestResponse)).start();
                 }
             } else {
-                // Fallback if executor is not available
                 new Thread(new ScannerThread(iHttpRequestResponse)).start();
             }
         }
@@ -118,7 +114,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 String targetUrlStr = helpers.analyzeRequest(reqRes).getUrl().toString();
                 printStatus("Starting scan: " + targetUrlStr);
                 
-                // Initial path mapping check
                 updateStatus("Initializing...");
                 if (!RequestSender.initialTest(reqRes)) {
                     printStatus("Scan aborted: Initial path mapping tests failed");
@@ -130,7 +125,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     randomSegment = "test";
                 }
                 
-                // Result storage
                 Map<String, Set<String>> vulnerableDelimiterCombinations = new HashMap<>();
                 Map<String, Map<String, String>> successfulNormalizationDetails = new HashMap<>();
                 Map<String, String> successfulPrefixExploits = new HashMap<>();
@@ -140,7 +134,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 boolean hashTraversalVulnerable = false;
                 String successfulTraversalPath = null;
 
-                // Test Self-Referential Normalization
                 updateStatus("Testing self-referential normalization...");
                 List<String> targetRelativeSegments = Arrays.asList(
                     "resources/", "static/", "css/", "js/", "images/", "public/", "assets/",
@@ -161,7 +154,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Test Hash Path Traversal
                 updateStatus("Testing hash-based traversal...");
                 String[] traversalPatterns = {
                     "%2f%2e%2e%2f", "%2f..%2f", "%252f%252e%252e%252f", "/%2e%2e/", "%2f%2e%2e"
@@ -181,7 +173,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Test Delimiter + Extensions
                 updateStatus("Testing delimiter + extensions...");
                 List<String> allExtensions = new ArrayList<>(Arrays.asList(RequestSender.INITIAL_TEST_EXTENSIONS));
                 allExtensions.addAll(Arrays.asList(RequestSender.OTHER_TEST_EXTENSIONS));
@@ -194,7 +185,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Test Path Normalization
                 updateStatus("Testing path normalization...");
                 List<String> knownPaths = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PATHS);
                 List<String> normalizationTemplates = Arrays.asList(RequestSender.NORMALIZATION_TEMPLATES);
@@ -213,7 +203,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Test Relative Path Normalization
                 updateStatus("Testing relative normalization...");
                 String specificRelativePath = "%2f%2e%2e%2frobots.txt";
                 for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
@@ -222,7 +211,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Test Prefix Normalization
                 updateStatus("Testing prefix normalization...");
                 List<String> knownPrefixes = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PREFIXES);
                 for (String delimiter : Arrays.asList("/", ";", "?", "%23", "%3f")) {
@@ -234,7 +222,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Test Reverse Traversal
                 updateStatus("Testing reverse traversal...");
                 String[] reverseTraversalPaths = {
                     "/resources/", "/static/", "/assets/", "/css/", "/js/", "/images/", "/public/"
@@ -245,7 +232,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Report findings
                 updateStatus("Analyzing results...");
                 boolean anyHits = !successfulSelfRefExploits.isEmpty() || 
                                 hashTraversalVulnerable || 
@@ -381,7 +367,6 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
     @Override
     public void extensionUnloaded() {
-        // Synchronize to prevent race conditions with runScannerForRequest
         synchronized (this) {
             if (executor != null && !executor.isShutdown()) {
                 executor.shutdownNow();
