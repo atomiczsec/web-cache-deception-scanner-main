@@ -151,7 +151,8 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 
                 updateStatus("Initializing...");
                 long initStart = System.currentTimeMillis();
-                if (!RequestSender.initialTest(reqRes)) {
+                String initialRandomSegment = RequestSender.initialTest(reqRes);
+                if (initialRandomSegment == null) {
                     logWarning("Scan aborted: Initial path mapping tests failed");
                     return;
                 }
@@ -172,9 +173,11 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                String randomSegment = reqRes.getComment();
+                String randomSegment = initialRandomSegment;
                 if (randomSegment == null || randomSegment.isEmpty()) {
-                    randomSegment = "test";
+                    // Should not happen, but fall back to a fresh random value if the initial test
+                    // completed without producing a usable segment
+                    randomSegment = RequestSender.generateRandomString(5);
                 }
                 
                 Map<String, Set<String>> vulnerableDelimiterCombinations = new HashMap<>();
