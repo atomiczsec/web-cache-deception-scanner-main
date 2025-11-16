@@ -19,7 +19,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
     private static IBurpExtenderCallbacks callbacks;
     private static IExtensionHelpers helpers;
-    private static ForkJoinPool executor;
+    private static ThreadPoolExecutor executor;
     private static final AtomicLong scanStartTime = new AtomicLong(0);
 
     protected static IExtensionHelpers getHelpers() {
@@ -73,23 +73,29 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
         helpers = iBurpExtenderCallbacks.getHelpers();
 
         int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
-        executor = new ForkJoinPool(parallelism, ForkJoinPool.defaultForkJoinWorkerThreadFactory, null, true);
+        executor = new ThreadPoolExecutor(
+                parallelism,
+                parallelism,
+                60L,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.allowCoreThreadTimeOut(false);
         logInfo("Version " + VERSION + " loaded with parallelism: " + parallelism);
     }
 
 
     private void runScannerForRequest(IHttpRequestResponse iHttpRequestResponse) {
-        synchronized (this) {
-            if (executor != null && !executor.isShutdown()) {
-                try {
-                    executor.execute(new ScannerThread(iHttpRequestResponse));
-                } catch (RejectedExecutionException e) {
-                    logWarning("Executor unavailable, falling back to new thread: " + e.getMessage());
-                    new Thread(new ScannerThread(iHttpRequestResponse)).start();
-                }
-            } else {
+        ThreadPoolExecutor currentExecutor = executor;
+        if (currentExecutor != null && !currentExecutor.isShutdown()) {
+            try {
+                currentExecutor.execute(new ScannerThread(iHttpRequestResponse));
+            } catch (RejectedExecutionException e) {
+                logWarning("Executor queue full, falling back to new thread: " + e.getMessage());
                 new Thread(new ScannerThread(iHttpRequestResponse)).start();
             }
+        } else {
+            new Thread(new ScannerThread(iHttpRequestResponse)).start();
         }
     }
 
@@ -495,19 +501,18 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
     @Override
     public void extensionUnloaded() {
-        synchronized (this) {
-            if (executor != null && !executor.isShutdown()) {
-                executor.shutdown();
-                try {
-                    // Wait for tasks to complete
-                    if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                        executor.shutdownNow();
-                        logWarning("Some scanning tasks may not have completed cleanly");
-                    }
-                } catch (InterruptedException e) {
-                    executor.shutdownNow();
-                    Thread.currentThread().interrupt();
+        ThreadPoolExecutor currentExecutor = executor;
+        if (currentExecutor != null && !currentExecutor.isShutdown()) {
+            currentExecutor.shutdown();
+            try {
+                // Wait for tasks to complete
+                if (!currentExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    currentExecutor.shutdownNow();
+                    logWarning("Some scanning tasks may not have completed cleanly");
                 }
+            } catch (InterruptedException e) {
+                currentExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
             }
         }
     }
