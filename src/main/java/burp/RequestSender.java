@@ -137,15 +137,15 @@ class RequestSender {
      * 1. Authenticated and unauthenticated responses are DIFFERENT (confirms auth is required)
      * 2. Authenticated response with appended segment is SIMILAR to original (confirms backend ignores trailing segments)
      */
-    protected static boolean initialTest(IHttpRequestResponse message) {
+    protected static String initialTest(IHttpRequestResponse message) {
         byte[] orgRequest = buildHttpRequest(message, null, null, true);
         Map<String, Object> orgDetails = retrieveResponseDetails(message.getHttpService(), orgRequest);
         if (orgDetails == null) {
-            return false;
+            return null;
         }
         int orgStatusCode = (int) orgDetails.get("statusCode");
         if (orgStatusCode < 200 || orgStatusCode >= 300) {
-            return false; // Original request must succeed
+            return null; // Original request must succeed
         }
         byte[] originalAuthBody = (byte[]) orgDetails.get("body");
 
@@ -154,7 +154,7 @@ class RequestSender {
         byte[] unAuthedRequest = buildHttpRequest(message, null, null, false);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unAuthedRequest);
         if (unauthDetails == null) {
-            return false; 
+            return null;
         }
         int unauthStatusCode = (int) unauthDetails.get("statusCode");
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
@@ -165,7 +165,7 @@ class RequestSender {
         // If unauthenticated response is similar, this endpoint doesn't require auth - skip it
         if (unauthedIsSimilar) {
             BurpExtender.logDebug("Initial test failed: Unauthenticated response similar to authenticated");
-            return false;
+            return null;
         }
 
         // Step 2: Verify that appending a random segment returns SIMILAR content
@@ -174,11 +174,11 @@ class RequestSender {
         byte[] testRequest = buildHttpRequestWithSegment(message, randomSegment, null, true, "/");
         Map<String, Object> appendedDetails = retrieveResponseDetails(message.getHttpService(), testRequest);
         if (appendedDetails == null) {
-            return false;
+            return null;
         }
         int appendedStatusCode = (int) appendedDetails.get("statusCode");
         if (appendedStatusCode < 200 || appendedStatusCode >= 300) {
-            return false; // Appended request must also succeed
+            return null; // Appended request must also succeed
         }
         byte[] appendedBody = (byte[]) appendedDetails.get("body");
 
@@ -187,12 +187,11 @@ class RequestSender {
 
         if (!appendIsSimilar) {
             BurpExtender.logDebug("Initial test failed: Appended segment response not similar to original");
-            return false;
+            return null;
         }
 
         // Both conditions met: auth required AND backend ignores trailing segments
-        message.setComment(randomSegment);
-        return true;
+        return randomSegment;
     }
 
     /**
