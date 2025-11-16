@@ -1,12 +1,14 @@
 package burp;
 
-import org.apache.commons.text.similarity.JaroWinklerSimilarity;
-import org.apache.commons.text.similarity.LevenshteinDistance;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import org.apache.commons.text.similarity.JaroWinklerSimilarity;
+import org.apache.commons.text.similarity.LevenshteinDistance;
 
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -37,6 +39,11 @@ class RequestSender {
     private final static int      REQUEST_TIMEOUT_MS = 10000; // 10 seconds
     private final static int      MIN_RETRY_DELAY_MS = 100;
     private final static int      MAX_RETRY_DELAY_MS = 2000;
+    private static final Charset  DEFAULT_CHARSET = StandardCharsets.ISO_8859_1;
+    private static final Pattern  CHARSET_PATTERN = Pattern.compile("charset=([^;\\s]+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern  SCRIPT_TAG_PATTERN = Pattern.compile("<script[^>]*>.*?</script>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final JaroWinklerSimilarity JARO_WINKLER = new JaroWinklerSimilarity();
+    private static final LevenshteinDistance LEVENSHTEIN = new LevenshteinDistance();
     
     // High-performance Caffeine cache with TTL
     private static final Cache<String, Map<String, Object>> RESPONSE_CACHE = Caffeine.newBuilder()
@@ -160,7 +167,9 @@ class RequestSender {
         int unauthStatusCode = (int) unauthDetails.get("statusCode");
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
 
-        Map<String, Object> step1Similarity = testSimilar(new String(originalAuthBody), new String(unauthBody));
+        Map<String, Object> step1Similarity = testSimilar(
+                bytesToString(originalAuthBody, orgDetails),
+                bytesToString(unauthBody, unauthDetails));
         boolean unauthedIsSimilar = (boolean) step1Similarity.get("similar");
 
         // If unauthenticated response is similar, this endpoint doesn't require auth - skip it
@@ -183,7 +192,9 @@ class RequestSender {
         }
         byte[] appendedBody = (byte[]) appendedDetails.get("body");
 
-        Map<String, Object> step2Similarity = testSimilar(new String(originalAuthBody), new String(appendedBody));
+        Map<String, Object> step2Similarity = testSimilar(
+                bytesToString(originalAuthBody, orgDetails),
+                bytesToString(appendedBody, appendedDetails));
         boolean appendIsSimilar = (boolean) step2Similarity.get("similar");
 
         if (!appendIsSimilar) {
@@ -227,7 +238,9 @@ class RequestSender {
         }
 
         // Verify crafted URL returns similar content to original (backend ignores trailing segments)
-        Map<String, Object> craftedSimilarity = testSimilar(new String(originalAuthBody), new String(authBody));
+        Map<String, Object> craftedSimilarity = testSimilar(
+                bytesToString(originalAuthBody, originalAuthDetails),
+                bytesToString(authBody, authDetails));
         if (!(boolean) craftedSimilarity.get("similar")) {
             return false; // Crafted URL must return similar content to original
         }
@@ -246,12 +259,16 @@ class RequestSender {
         }
 
         // Check 1: Unauthenticated response should be similar to authenticated crafted response
-        Map<String, Object> similarityResult = testSimilar(new String(authBody), new String(unauthBody));
+        Map<String, Object> similarityResult = testSimilar(
+                bytesToString(authBody, authDetails),
+                bytesToString(unauthBody, unauthDetails));
         boolean similarToCrafted = (boolean) similarityResult.get("similar");
         
         // Check 2: Unauthenticated response should also be similar to ORIGINAL authenticated endpoint
         // This confirms we're caching the sensitive content, not just a static file
-        Map<String, Object> originalSimilarity = testSimilar(new String(originalAuthBody), new String(unauthBody));
+        Map<String, Object> originalSimilarity = testSimilar(
+                bytesToString(originalAuthBody, originalAuthDetails),
+                bytesToString(unauthBody, unauthDetails));
         boolean similarToOriginal = (boolean) originalSimilarity.get("similar");
         
         // Both checks must pass for a confirmed vulnerability
@@ -284,7 +301,9 @@ class RequestSender {
         }
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
 
-        Map<String, Object> similarityResult = testSimilar(new String(authBody), new String(unauthBody));
+        Map<String, Object> similarityResult = testSimilar(
+                bytesToString(authBody, authDetails),
+                bytesToString(unauthBody, unauthDetails));
         return (boolean) similarityResult.get("similar");
     }
 
@@ -396,6 +415,30 @@ class RequestSender {
                     BurpExtender.logDebug("Circuit breaker open for " + hostKey);
                     return null;
                 }
+        return retrieveResponseDetails(service, request, 0);
+    }
+    
+    private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request, int retryCount) {
+        try {
+            String hostKey = service.getHost();
+            String cacheKey = buildServiceCacheKey(service, request);
+            
+            // Check circuit breaker
+            if (isCircuitOpen(hostKey)) {
+                BurpExtender.logDebug("Circuit breaker open for " + hostKey);
+                return null;
+            }
+            
+            // Rate limiting
+            if (!checkRateLimit(hostKey)) {
+                try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+            }
+            
+            // Check cache first
+            Map<String, Object> cached = RESPONSE_CACHE.getIfPresent(cacheKey);
+            if (cached != null) {
+                return cached;
+            }
 
                 waitForRateLimit(hostKey);
 
@@ -447,6 +490,28 @@ class RequestSender {
         }
 
         return null;
+    }
+
+    /**
+     * Builds a cache key that normalizes the service attributes (protocol, host, port)
+     * and appends the request hash. This ensures equivalent services share cache
+     * entries while keeping cache growth in check.
+     */
+    private static String buildServiceCacheKey(IHttpService service, byte[] request) {
+        String protocol = service.getProtocol() != null
+                ? service.getProtocol().toLowerCase(Locale.ROOT)
+                : "http";
+        String host = service.getHost() != null
+                ? service.getHost().toLowerCase(Locale.ROOT)
+                : "";
+        int port = service.getPort();
+
+        if (port <= 0) {
+            port = "https".equals(protocol) ? 443 : 80;
+        }
+
+        String serviceKey = protocol + "://" + host + ":" + port;
+        return serviceKey + "|" + Arrays.hashCode(request);
     }
     
     private static boolean isCircuitOpen(String hostKey) {
@@ -545,8 +610,45 @@ class RequestSender {
         // Remove UUIDs
         body = UUID_PATTERN.matcher(body).replaceAll("");
         // Remove script tags with dynamic content
-        body = Pattern.compile("<script[^>]*>.*?</script>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(body).replaceAll("");
+        body = SCRIPT_TAG_PATTERN.matcher(body).replaceAll("");
         return body;
+    }
+
+    private static String bytesToString(byte[] data) {
+        return bytesToString(data, (List<String>) null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String bytesToString(byte[] data, Map<String, Object> details) {
+        List<String> headers = null;
+        if (details != null) {
+            headers = (List<String>) details.get("headers");
+        }
+        return bytesToString(data, headers);
+    }
+
+    private static String bytesToString(byte[] data, List<String> headers) {
+        if (data == null || data.length == 0) {
+            return "";
+        }
+
+        Charset charset = DEFAULT_CHARSET;
+        if (headers != null) {
+            String contentType = getHeaderValue(headers, "Content-Type");
+            if (contentType != null) {
+                Matcher matcher = CHARSET_PATTERN.matcher(contentType);
+                if (matcher.find()) {
+                    String charsetName = matcher.group(1).trim();
+                    try {
+                        charset = Charset.forName(charsetName);
+                    } catch (Exception ignored) {
+                        // Fall back to ISO-8859-1 if charset is invalid or unsupported
+                    }
+                }
+            }
+        }
+
+        return new String(data, charset);
     }
 
     /**
@@ -559,12 +661,8 @@ class RequestSender {
         String cleanedFirst = cleanResponseBody(firstString);
         String cleanedSecond = cleanResponseBody(secondString);
 
-        // Use org.apache.commons.text.similarity classes
-        JaroWinklerSimilarity jaroWinkler = new JaroWinklerSimilarity();
-        LevenshteinDistance levenshtein = new LevenshteinDistance();
-
-        double jaroDist = jaroWinkler.apply(cleanedFirst, cleanedSecond);
-        int levenDist = levenshtein.apply(cleanedFirst, cleanedSecond);
+        double jaroDist = JARO_WINKLER.apply(cleanedFirst, cleanedSecond);
+        int levenDist = LEVENSHTEIN.apply(cleanedFirst, cleanedSecond);
 
         // Fixed similarity logic: Both metrics must indicate similarity for a positive match
         // JaroWinklerSimilarity returns 0-1 (higher is better)
@@ -645,7 +743,9 @@ class RequestSender {
         List<String> headers2 = (List<String>) details2.get("headers");
         byte[] body2 = (byte[]) details2.get("body");
 
-        Map<String, Object> similarityResult = testSimilar(new String(originalAuthBody), new String(body2));
+        Map<String, Object> similarityResult = testSimilar(
+                bytesToString(originalAuthBody, originalAuthDetails),
+                bytesToString(body2, details2));
         return (boolean) similarityResult.get("similar");
     }
 
@@ -754,7 +854,9 @@ class RequestSender {
         }
 
         // Compare bodies
-        Map<String, Object> similarityResult = testSimilar(new String(body1), new String(body2));
+        Map<String, Object> similarityResult = testSimilar(
+                bytesToString(body1, details1),
+                bytesToString(body2, details2));
         boolean contentSimilar = (boolean) similarityResult.get("similar");
 
         if (contentSimilar) {
@@ -897,7 +999,9 @@ class RequestSender {
         }
 
         if (firstReqOk && secondReqOk) {
-             Map<String, Object> similarityResult = testSimilar(new String(body1), new String(body2));
+             Map<String, Object> similarityResult = testSimilar(
+                     bytesToString(body1, details1),
+                     bytesToString(body2, details2));
              return (boolean) similarityResult.get("similar");
         }
 
@@ -984,7 +1088,9 @@ class RequestSender {
             return false;
         }
         
-        Map<String, Object> contentMatchResult = testSimilar(new String(originalAuthBody), new String(body1));
+        Map<String, Object> contentMatchResult = testSimilar(
+                bytesToString(originalAuthBody, originalAuthDetails),
+                bytesToString(body1, details1));
         if (!(boolean) contentMatchResult.get("similar")) {
             return false;
         }
@@ -1016,7 +1122,9 @@ class RequestSender {
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
         
         if (unauthStatusCode == 200) {
-            Map<String, Object> unauthSimilarity = testSimilar(new String(originalAuthBody), new String(unauthBody));
+            Map<String, Object> unauthSimilarity = testSimilar(
+                    bytesToString(originalAuthBody, originalAuthDetails),
+                    bytesToString(unauthBody, unauthDetails));
             if ((boolean) unauthSimilarity.get("similar")) {
                 return true;
             }
@@ -1069,7 +1177,10 @@ class RequestSender {
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
         if (unauthDetails == null) return false;
         
-        Map<String, Object> similarity = testSimilar(new String(originalBody), new String((byte[]) unauthDetails.get("body")));
+        byte[] unauthBody = (byte[]) unauthDetails.get("body");
+        Map<String, Object> similarity = testSimilar(
+                bytesToString(originalBody, originalDetails),
+                bytesToString(unauthBody, unauthDetails));
         return (boolean) similarity.get("similar");
     }
     
@@ -1135,7 +1246,9 @@ class RequestSender {
         if (unauthDetails == null) return false;
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
 
-        Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
+        Map<String, Object> similarity = testSimilar(
+                bytesToString(authBody, authDetails),
+                bytesToString(unauthBody, unauthDetails));
         return (boolean) similarity.get("similar");
     }
     
@@ -1164,7 +1277,9 @@ class RequestSender {
         if (unauthDetails == null) return false;
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
         
-        Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
+        Map<String, Object> similarity = testSimilar(
+                bytesToString(authBody, authDetails),
+                bytesToString(unauthBody, unauthDetails));
         return (boolean) similarity.get("similar");
     }
     
@@ -1192,7 +1307,9 @@ class RequestSender {
         if (unauthDetails == null) return false;
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
         
-        Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
+        Map<String, Object> similarity = testSimilar(
+                bytesToString(authBody, authDetails),
+                bytesToString(unauthBody, unauthDetails));
         return (boolean) similarity.get("similar");
     }
     
@@ -1225,7 +1342,9 @@ class RequestSender {
             }
             
             byte[] body = (byte[]) details.get("body");
-            Map<String, Object> similarity = testSimilar(new String(originalBody), new String(body));
+            Map<String, Object> similarity = testSimilar(
+                    bytesToString(originalBody, originalDetails),
+                    bytesToString(body, details));
             if ((boolean) similarity.get("similar")) {
                 similarResponses++;
             }
