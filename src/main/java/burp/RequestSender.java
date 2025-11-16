@@ -411,7 +411,7 @@ class RequestSender {
     private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request, int retryCount) {
         try {
             String hostKey = service.getHost();
-            String cacheKey = service.toString() + Arrays.hashCode(request);
+            String cacheKey = buildServiceCacheKey(service, request);
             
             // Check circuit breaker
             if (isCircuitOpen(hostKey)) {
@@ -477,6 +477,28 @@ class RequestSender {
             }
             return null;
         }
+    }
+
+    /**
+     * Builds a cache key that normalizes the service attributes (protocol, host, port)
+     * and appends the request hash. This ensures equivalent services share cache
+     * entries while keeping cache growth in check.
+     */
+    private static String buildServiceCacheKey(IHttpService service, byte[] request) {
+        String protocol = service.getProtocol() != null
+                ? service.getProtocol().toLowerCase(Locale.ROOT)
+                : "http";
+        String host = service.getHost() != null
+                ? service.getHost().toLowerCase(Locale.ROOT)
+                : "";
+        int port = service.getPort();
+
+        if (port <= 0) {
+            port = "https".equals(protocol) ? 443 : 80;
+        }
+
+        String serviceKey = protocol + "://" + host + ":" + port;
+        return serviceKey + "|" + Arrays.hashCode(request);
     }
     
     private static boolean isCircuitOpen(String hostKey) {
