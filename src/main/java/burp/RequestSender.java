@@ -22,6 +22,7 @@ import java.util.HashSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.Locale;
 
 class RequestSender {
 
@@ -289,44 +290,30 @@ class RequestSender {
     // Renamed original buildHttpRequest to avoid confusion
     private static byte[] buildHttpRequestWithSegment(final IHttpRequestResponse reqRes, final String additional, final String extension,
                                            boolean addCookies, String delimiter) {
-        byte[] result;
-
         IRequestInfo reqInfo = BurpExtender.getHelpers().analyzeRequest(reqRes);
-        URL orgUrl = reqInfo.getUrl();
-        List<IParameter> params = reqInfo.getParameters();
-        List<String> headers = reqInfo.getHeaders();
-
-        // Create GET message
-        if ("GET".equals(reqInfo.getMethod())) {
-            URL url = null;
-            if (additional != null) {
-                try {
-                    // Use the new URL creation method with delimiter
-                    url = createNewURLWithSegment(orgUrl, additional, extension, delimiter);
-                } catch (MalformedURLException mue) {
-                    mue.printStackTrace(new java.io.PrintStream(BurpExtender.getCallbacks().getStderr()));
-                    return null; // Return null if URL creation fails
-                }
-            } else {
-                url = reqInfo.getUrl(); // Use original URL if no segment added
-            }
-
-            if (url == null) return null; // Exit if URL is null
-
-            result = BurpExtender.getHelpers().buildHttpRequest(url);
-
-            if (addCookies) {
-                for (IParameter p : params) {
-                    if (IParameter.PARAM_COOKIE == p.getType()) {
-                        result = BurpExtender.getHelpers().addParameter(result, p);
-                    }
-                }
-            }
-        } else { // Create POST message (Handle POST differently or maybe skip for now?)
+        RequestComponents components = cloneRequestComponents(reqRes, reqInfo);
+        if (components == null) {
             return null;
         }
 
-        return result;
+        URL orgUrl = reqInfo.getUrl();
+        if (orgUrl == null) {
+            return null;
+        }
+
+        URL mutatedUrl = null;
+        if (additional != null) {
+            try {
+                mutatedUrl = createNewURLWithSegment(orgUrl, additional, extension, delimiter);
+            } catch (MalformedURLException mue) {
+                mue.printStackTrace(new java.io.PrintStream(BurpExtender.getCallbacks().getStderr()));
+                return null;
+            }
+        }
+
+        String newTarget = mutatedUrl != null ? getTargetFromUrl(mutatedUrl) : getTargetFromUrl(orgUrl);
+        components.setTarget(newTarget);
+        return components.toByteArray(addCookies);
     }
 
     // Added overload for backward compatibility
@@ -338,44 +325,28 @@ class RequestSender {
     // New method to build request for normalization test (avoids double encoding path segments)
     private static byte[] buildHttpRequestWithNormalization(final IHttpRequestResponse reqRes, boolean addCookies, String delimiter, String normalizationSuffix) {
         IRequestInfo reqInfo = BurpExtender.getHelpers().analyzeRequest(reqRes);
-        URL orgUrl = reqInfo.getUrl();
-        List<String> headers = reqInfo.getHeaders();
-        byte[] result = null;
-
         if (!"GET".equals(reqInfo.getMethod())) {
              return null;
         }
 
-        try {
-            // Construct the new path manually
-            String targetPath = orgUrl.getPath();
-            String query = orgUrl.getQuery() != null ? "?" + orgUrl.getQuery() : "";
-            String newPathAndQuery = targetPath + delimiter + normalizationSuffix + query;
-
-            List<String> newHeaders = new ArrayList<>();
-            boolean firstLine = true;
-            for (String header : headers) {
-                if (firstLine && header.startsWith("GET ")) {
-                    String httpVersion = header.substring(header.lastIndexOf(" HTTP/"));
-                    newHeaders.add("GET " + newPathAndQuery + httpVersion);
-                    firstLine = false;
-                } else if (header.toLowerCase().startsWith("cookie:")) {
-                    if (addCookies) {
-                        newHeaders.add(header);
-                    }
-                    // else skip cookie header
-                } else {
-                     newHeaders.add(header);
-                 }
-            }
-            // Use buildHttpMessage to avoid URL object re-encoding the path
-            result = BurpExtender.getHelpers().buildHttpMessage(newHeaders, null); // Null body for GET
-
-        } catch (Exception e) {
+        RequestComponents components = cloneRequestComponents(reqRes, reqInfo);
+        if (components == null) {
             return null;
         }
 
-        return result;
+        URL orgUrl = reqInfo.getUrl();
+        if (orgUrl == null) {
+            return null;
+        }
+
+        String targetPath = orgUrl.getPath() != null ? orgUrl.getPath() : "/";
+        StringBuilder newTarget = new StringBuilder(targetPath);
+        newTarget.append(delimiter).append(normalizationSuffix);
+        String query = orgUrl.getQuery() != null ? "?" + orgUrl.getQuery() : "";
+        newTarget.append(query);
+
+        components.setTarget(newTarget.toString());
+        return components.toByteArray(addCookies);
     }
 
     // Renamed createNewURL to createNewURLWithSegment
@@ -1143,35 +1114,26 @@ class RequestSender {
         String query = url.getQuery() != null ? url.getQuery() : "";
         String newQuery = query.isEmpty() ? paramName + "=value1&" + paramName + "=value2" : query + "&" + paramName + "=value1&" + paramName + "=value2";
         
-        try {
-            URL newUrl = new URL(url.getProtocol(), url.getHost(), url.getPort(), url.getPath() + "?" + newQuery);
-            byte[] authRequest = BurpExtender.getHelpers().buildHttpRequest(newUrl);
-            
-            // Add cookies if needed
-            if (reqInfo.getMethod().equals("GET")) {
-                List<IParameter> params = reqInfo.getParameters();
-                for (IParameter p : params) {
-                    if (IParameter.PARAM_COOKIE == p.getType()) {
-                        authRequest = BurpExtender.getHelpers().addParameter(authRequest, p);
-                    }
-                }
-            }
-            
-            Map<String, Object> authDetails = retrieveResponseDetails(message.getHttpService(), authRequest);
-            if (authDetails == null) return false;
-            byte[] authBody = (byte[]) authDetails.get("body");
-            
-            // Test without auth
-            byte[] unauthRequest = BurpExtender.getHelpers().buildHttpRequest(newUrl);
-            Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
-            if (unauthDetails == null) return false;
-            byte[] unauthBody = (byte[]) unauthDetails.get("body");
-            
-            Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
-            return (boolean) similarity.get("similar");
-        } catch (MalformedURLException e) {
+        byte[] authRequest = buildHttpRequestWithQueryOverride(message, newQuery, true);
+        if (authRequest == null) {
             return false;
         }
+
+        Map<String, Object> authDetails = retrieveResponseDetails(message.getHttpService(), authRequest);
+        if (authDetails == null) return false;
+        byte[] authBody = (byte[]) authDetails.get("body");
+
+        byte[] unauthRequest = buildHttpRequestWithQueryOverride(message, newQuery, false);
+        if (unauthRequest == null) {
+            return false;
+        }
+
+        Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unauthRequest);
+        if (unauthDetails == null) return false;
+        byte[] unauthBody = (byte[]) unauthDetails.get("body");
+
+        Map<String, Object> similarity = testSimilar(new String(authBody), new String(unauthBody));
+        return (boolean) similarity.get("similar");
     }
     
     /**
@@ -1288,7 +1250,129 @@ class RequestSender {
             results.put("levenshtein", Integer.MAX_VALUE);
             return results;
         }
-        
+
         return testSimilar(firstString, secondString);
+    }
+
+    /**
+     * Builds a request by cloning the original message and replacing the query string.
+     */
+    private static byte[] buildHttpRequestWithQueryOverride(final IHttpRequestResponse reqRes, String newQuery, boolean addCookies) {
+        IRequestInfo reqInfo = BurpExtender.getHelpers().analyzeRequest(reqRes);
+        RequestComponents components = cloneRequestComponents(reqRes, reqInfo);
+        if (components == null) {
+            return null;
+        }
+
+        URL url = reqInfo.getUrl();
+        if (url == null) {
+            return null;
+        }
+
+        String basePath = url.getPath();
+        if (basePath == null || basePath.isEmpty()) {
+            basePath = "/";
+        }
+        String target = (newQuery == null || newQuery.isEmpty()) ? basePath : basePath + "?" + newQuery;
+        components.setTarget(target);
+        return components.toByteArray(addCookies);
+    }
+
+    private static RequestComponents cloneRequestComponents(IHttpRequestResponse reqRes, IRequestInfo reqInfo) {
+        if (reqRes == null) {
+            return null;
+        }
+
+        IRequestInfo analyzed = reqInfo != null ? reqInfo : BurpExtender.getHelpers().analyzeRequest(reqRes);
+        if (analyzed == null) {
+            return null;
+        }
+
+        List<String> headers = analyzed.getHeaders();
+        if (headers == null || headers.isEmpty()) {
+            return null;
+        }
+
+        String requestLine = headers.get(0);
+        String[] parts = requestLine.split(" ", 3);
+        if (parts.length < 3) {
+            return null;
+        }
+
+        List<String> headerLines = new ArrayList<>();
+        for (int i = 1; i < headers.size(); i++) {
+            headerLines.add(headers.get(i));
+        }
+
+        byte[] requestBytes = reqRes.getRequest();
+        if (requestBytes == null) {
+            return null;
+        }
+        int bodyOffset = analyzed.getBodyOffset();
+        if (bodyOffset < 0 || bodyOffset > requestBytes.length) {
+            bodyOffset = requestBytes.length;
+        }
+        byte[] body = bodyOffset < requestBytes.length ? Arrays.copyOfRange(requestBytes, bodyOffset, requestBytes.length) : null;
+
+        return new RequestComponents(parts[0], parts[1], parts[2], headerLines, body);
+    }
+
+    private static String getTargetFromUrl(URL url) {
+        if (url == null) {
+            return "/";
+        }
+        String file = url.getFile();
+        if (file == null || file.isEmpty()) {
+            return "/";
+        }
+        return file;
+    }
+
+    private static final class RequestComponents {
+        private final String method;
+        private final String httpVersion;
+        private String target;
+        private final List<String> headerLines;
+        private final byte[] body;
+
+        private RequestComponents(String method, String target, String httpVersion, List<String> headerLines, byte[] body) {
+            this.method = method;
+            this.target = target;
+            this.httpVersion = httpVersion;
+            this.headerLines = new ArrayList<>(headerLines);
+            this.body = body != null ? Arrays.copyOf(body, body.length) : null;
+        }
+
+        private void setTarget(String target) {
+            if (target == null || target.isEmpty()) {
+                this.target = "/";
+            } else {
+                this.target = target;
+            }
+        }
+
+        private void setOrReplaceHeader(String headerName, String value) {
+            String lowerName = headerName.toLowerCase(Locale.ROOT) + ":";
+            for (int i = 0; i < headerLines.size(); i++) {
+                String header = headerLines.get(i);
+                if (header.toLowerCase(Locale.ROOT).startsWith(lowerName)) {
+                    headerLines.set(i, headerName + ": " + value);
+                    return;
+                }
+            }
+            headerLines.add(headerName + ": " + value);
+        }
+
+        private byte[] toByteArray(boolean includeCookies) {
+            List<String> finalHeaders = new ArrayList<>();
+            finalHeaders.add(method + " " + target + " " + httpVersion);
+            for (String header : headerLines) {
+                if (!includeCookies && header.toLowerCase(Locale.ROOT).startsWith("cookie:")) {
+                    continue;
+                }
+                finalHeaders.add(header);
+            }
+            return BurpExtender.getHelpers().buildHttpMessage(finalHeaders, body);
+        }
     }
 }
