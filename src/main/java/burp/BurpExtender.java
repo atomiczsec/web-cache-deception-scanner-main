@@ -51,11 +51,15 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
     }
     
     protected static void logWarning(String message) {
-        callbacks.printOutput("[WCD] [WARNING] " + message);
+        if (callbacks != null) {
+            callbacks.printError("[WCD] [WARNING] " + message);
+        }
     }
-    
+
     protected static void logError(String message) {
-        callbacks.printOutput("[WCD] [ERROR] " + message);
+        if (callbacks != null) {
+            callbacks.printError("[WCD] [ERROR] " + message);
+        }
     }
     
     protected static void logTiming(String phase, long durationMs) {
@@ -341,14 +345,19 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                     
                     logInfo("VULNERABILITY FOUND: " + targetUrlStr);
-                    generateExploitDetails(reqRes, successfulSelfRefExploits, hashTraversalVulnerable, 
-                                         successfulTraversalPath, vulnerableDelimiterCombinations, 
-                                         successfulNormalizationDetails, successfulPrefixExploits, 
+                    String exploitSummary = generateExploitDetails(reqRes, successfulSelfRefExploits, hashTraversalVulnerable,
+                                         successfulTraversalPath, vulnerableDelimiterCombinations,
+                                         successfulNormalizationDetails, successfulPrefixExploits,
                                          successfulRelativeExploits, successfulReverseTraversals,
                                          successfulHeaderAttacks, successfulHPPAttacks,
                                          successfulCaseAttacks, successfulUnicodeAttacks, detectedCDN);
-                    
+
                     callbacks.addScanIssue(issue);
+                    String alertMessage = "Web Cache Deception issue identified at " + targetUrlStr;
+                    if (exploitSummary != null && !exploitSummary.isEmpty()) {
+                        alertMessage += "\n" + exploitSummary;
+                    }
+                    callbacks.issueAlert(alertMessage);
                 } else {
                     logInfo("No vulnerabilities found: " + targetUrlStr);
                 }
@@ -359,7 +368,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
             }
         }
         
-        private void generateExploitDetails(IHttpRequestResponse reqRes, 
+        private String generateExploitDetails(IHttpRequestResponse reqRes,
                                           Map<String, Map<String, String>> successfulSelfRefExploits,
                                           boolean hashTraversalVulnerable, String successfulTraversalPath,
                                           Map<String, Set<String>> vulnerableDelimiterCombinations,
@@ -473,6 +482,8 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 logInfo(String.format("Found %d exploit(s):", exploitCount));
                 print(summary.toString());
             }
+
+            return summary.toString();
         }
         
         private String extractFilename(String path) {
