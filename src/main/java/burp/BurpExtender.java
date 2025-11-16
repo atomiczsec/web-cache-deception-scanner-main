@@ -385,88 +385,96 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 summary.append(String.format("[INFO] Detected CDN/Cache: %s\n", detectedCDN));
             }
             
+            String targetPath = helpers.analyzeRequest(reqRes).getUrl().getPath();
+            String targetFilename = extractFilename(targetPath);
+
             // Self-Referential Normalization Exploits
             if (!successfulSelfRefExploits.isEmpty()) {
-                String firstDelim = successfulSelfRefExploits.keySet().iterator().next();
-                Map<String, String> segmentMap = successfulSelfRefExploits.get(firstDelim);
-                String segment = segmentMap.keySet().iterator().next();
-                String targetPath = helpers.analyzeRequest(reqRes).getUrl().getPath();
-                String targetFilename = extractFilename(targetPath);
-                String exploitPath = segment + segmentMap.get(segment) + targetFilename;
-                String exploitUrl = baseUrl + firstDelim + exploitPath + "?wcd=" + RequestSender.generateRandomString(4);
-                summary.append(String.format("[HIGH] Self-Referential: %s\n", exploitUrl));
-                exploitCount++;
+                for (Map.Entry<String, Map<String, String>> delimiterEntry : successfulSelfRefExploits.entrySet()) {
+                    for (Map.Entry<String, String> segmentEntry : delimiterEntry.getValue().entrySet()) {
+                        String exploitPath = segmentEntry.getKey() + segmentEntry.getValue() + targetFilename;
+                        String exploitUrl = baseUrl + delimiterEntry.getKey() + exploitPath + "?wcd=" +
+                                RequestSender.generateRandomString(4);
+                        summary.append(String.format("%d. [HIGH] Self-Referential: %s\n", ++exploitCount, exploitUrl));
+                    }
+                }
             }
             
             // Hash Path Traversal Exploits
             if (hashTraversalVulnerable && successfulTraversalPath != null) {
-                String exploitUrl = baseUrl + "%23" + successfulTraversalPath + "?wcd=" + RequestSender.generateRandomString(4);
-                summary.append(String.format("[HIGH] Hash Traversal: %s\n", exploitUrl));
-                exploitCount++;
+                String exploitUrl = baseUrl + "%23" + successfulTraversalPath + "?wcd=" +
+                        RequestSender.generateRandomString(4);
+                summary.append(String.format("%d. [HIGH] Hash Traversal: %s\n", ++exploitCount, exploitUrl));
             }
-            
+
             // Reverse Traversal Exploits
             if (!successfulReverseTraversals.isEmpty()) {
-                String targetPath = helpers.analyzeRequest(reqRes).getUrl().getPath();
-                String targetFilename = extractFilename(targetPath);
-                String cachePath = successfulReverseTraversals.keySet().iterator().next();
-                String exploitUrl = baseUrl.replace(targetPath, cachePath + "..%2f" + targetFilename) + "?wcd=" + RequestSender.generateRandomString(4);
-                summary.append(String.format("[HIGH] Reverse Traversal: %s\n", exploitUrl));
-                exploitCount++;
+                for (String cachePath : successfulReverseTraversals.keySet()) {
+                    String exploitUrl = baseUrl.replace(targetPath, cachePath + "..%2f" + targetFilename) + "?wcd=" +
+                            RequestSender.generateRandomString(4);
+                    summary.append(String.format("%d. [HIGH] Reverse Traversal: %s\n", ++exploitCount, exploitUrl));
+                }
             }
-            
+
             // Delimiter + Extension Exploits
             if (!vulnerableDelimiterCombinations.isEmpty()) {
-                Map.Entry<String, Set<String>> entry = vulnerableDelimiterCombinations.entrySet().iterator().next();
-                String ext = entry.getValue().iterator().next();
-                String exploitUrl = baseUrl + entry.getKey() + "test." + ext + "?wcd=" + RequestSender.generateRandomString(4);
-                summary.append(String.format("[MEDIUM] Delimiter+Ext: %s\n", exploitUrl));
-                exploitCount++;
+                for (Map.Entry<String, Set<String>> entry : vulnerableDelimiterCombinations.entrySet()) {
+                    for (String ext : entry.getValue()) {
+                        String exploitUrl = baseUrl + entry.getKey() + "test." + ext + "?wcd=" +
+                                RequestSender.generateRandomString(4);
+                        summary.append(String.format("%d. [MEDIUM] Delimiter+Ext: %s\n", ++exploitCount, exploitUrl));
+                    }
+                }
             }
-            
+
             // Relative Path Normalization Exploits
             if (!successfulRelativeExploits.isEmpty()) {
-                Map.Entry<String, String> entry = successfulRelativeExploits.entrySet().iterator().next();
-                String exploitUrl = baseUrl + entry.getKey() + entry.getValue() + "?wcd=" + RequestSender.generateRandomString(4);
-                summary.append(String.format("[MEDIUM] Relative Norm: %s\n", exploitUrl));
-                exploitCount++;
+                for (Map.Entry<String, String> entry : successfulRelativeExploits.entrySet()) {
+                    String exploitUrl = baseUrl + entry.getKey() + entry.getValue() + "?wcd=" +
+                            RequestSender.generateRandomString(4);
+                    summary.append(String.format("%d. [MEDIUM] Relative Norm: %s\n", ++exploitCount, exploitUrl));
+                }
             }
-            
+
             // Prefix Normalization Exploits
             if (!successfulPrefixExploits.isEmpty()) {
-                Map.Entry<String, String> entry = successfulPrefixExploits.entrySet().iterator().next();
-                String prefix = entry.getValue().startsWith("/") ? entry.getValue().substring(1) : entry.getValue();
-                String exploitUrl = baseUrl + entry.getKey() + "%2f%2e%2e%2f" + prefix + "?wcd=" + RequestSender.generateRandomString(4);
-                summary.append(String.format("[MEDIUM] Prefix Norm: %s\n", exploitUrl));
-                exploitCount++;
+                for (Map.Entry<String, String> entry : successfulPrefixExploits.entrySet()) {
+                    String prefix = entry.getValue().startsWith("/") ? entry.getValue().substring(1) : entry.getValue();
+                    String exploitUrl = baseUrl + entry.getKey() + "%2f%2e%2e%2f" + prefix + "?wcd=" +
+                            RequestSender.generateRandomString(4);
+                    summary.append(String.format("%d. [MEDIUM] Prefix Norm: %s\n", ++exploitCount, exploitUrl));
+                }
             }
-            
+
             // Header-based attacks
             if (!successfulHeaderAttacks.isEmpty()) {
-                Map.Entry<String, String> entry = successfulHeaderAttacks.entrySet().iterator().next();
-                summary.append(String.format("[HIGH] Header Attack: %s: %s\n", entry.getKey(), entry.getValue()));
-                exploitCount++;
+                for (Map.Entry<String, String> entry : successfulHeaderAttacks.entrySet()) {
+                    summary.append(String.format("%d. [HIGH] Header Attack: %s: %s\n", ++exploitCount,
+                            entry.getKey(), entry.getValue()));
+                }
             }
-            
+
             // HPP attacks
             if (!successfulHPPAttacks.isEmpty()) {
-                Map.Entry<String, String> entry = successfulHPPAttacks.entrySet().iterator().next();
-                summary.append(String.format("[MEDIUM] HPP Attack: Parameter %s\n", entry.getKey()));
-                exploitCount++;
+                for (Map.Entry<String, String> entry : successfulHPPAttacks.entrySet()) {
+                    summary.append(String.format("%d. [MEDIUM] HPP Attack: Parameter %s\n", ++exploitCount, entry.getKey()));
+                }
             }
-            
+
             // Case sensitivity attacks
             if (!successfulCaseAttacks.isEmpty()) {
-                Map.Entry<String, String> entry = successfulCaseAttacks.entrySet().iterator().next();
-                summary.append(String.format("[MEDIUM] Case Sensitivity: %s with %s\n", entry.getKey(), entry.getValue()));
-                exploitCount++;
+                for (Map.Entry<String, String> entry : successfulCaseAttacks.entrySet()) {
+                    summary.append(String.format("%d. [MEDIUM] Case Sensitivity: %s with %s\n", ++exploitCount,
+                            entry.getKey(), entry.getValue()));
+                }
             }
-            
+
             // Unicode attacks
             if (!successfulUnicodeAttacks.isEmpty()) {
-                Map.Entry<String, String> entry = successfulUnicodeAttacks.entrySet().iterator().next();
-                summary.append(String.format("[MEDIUM] Unicode Normalization: %s\n", entry.getKey()));
-                exploitCount++;
+                for (Map.Entry<String, String> entry : successfulUnicodeAttacks.entrySet()) {
+                    summary.append(String.format("%d. [MEDIUM] Unicode Normalization: %s\n", ++exploitCount,
+                            entry.getKey()));
+                }
             }
             
             if (exploitCount > 0) {
