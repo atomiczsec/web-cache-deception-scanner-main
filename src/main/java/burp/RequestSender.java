@@ -105,13 +105,21 @@ class RequestSender {
     };
     
     // CDN fingerprinting patterns
-    protected final static Map<String, String[]> CDN_PATTERNS = new HashMap<>();
+    protected final static Map<String, Pattern[]> CDN_PATTERNS = new HashMap<>();
     static {
-        CDN_PATTERNS.put("cloudflare", new String[]{"CF-Cache-Status", "CF-Ray", "Server: cloudflare"});
-        CDN_PATTERNS.put("akamai", new String[]{"X-Akamai-", "Akamai-GRN"});
-        CDN_PATTERNS.put("fastly", new String[]{"Fastly-", "X-Served-By"});
-        CDN_PATTERNS.put("varnish", new String[]{"X-Varnish", "Via: .*varnish"});
-        CDN_PATTERNS.put("squid", new String[]{"X-Squid-Error", "Server: squid"});
+        CDN_PATTERNS.put("cloudflare", compilePatterns("CF-Cache-Status", "CF-Ray", "Server: cloudflare"));
+        CDN_PATTERNS.put("akamai", compilePatterns("X-Akamai-", "Akamai-GRN"));
+        CDN_PATTERNS.put("fastly", compilePatterns("Fastly-", "X-Served-By"));
+        CDN_PATTERNS.put("varnish", compilePatterns("X-Varnish", "Via: .*varnish"));
+        CDN_PATTERNS.put("squid", compilePatterns("X-Squid-Error", "Server: squid"));
+    }
+
+    private static Pattern[] compilePatterns(String... rawPatterns) {
+        Pattern[] compiled = new Pattern[rawPatterns.length];
+        for (int i = 0; i < rawPatterns.length; i++) {
+            compiled[i] = Pattern.compile(rawPatterns[i], Pattern.CASE_INSENSITIVE);
+        }
+        return compiled;
     }
 
     // Regex patterns for stripping dynamic content
@@ -1050,13 +1058,14 @@ class RequestSender {
     protected static String detectCDN(List<String> headers) {
         if (headers == null) return null;
         
-        String headerStr = String.join("\n", headers).toLowerCase();
-        for (Map.Entry<String, String[]> entry : CDN_PATTERNS.entrySet()) {
-            String cdnName = entry.getKey();
-            String[] patterns = entry.getValue();
-            for (String pattern : patterns) {
-                if (headerStr.contains(pattern.toLowerCase())) {
-                    return cdnName;
+        for (String header : headers) {
+            for (Map.Entry<String, Pattern[]> entry : CDN_PATTERNS.entrySet()) {
+                String cdnName = entry.getKey();
+                Pattern[] patterns = entry.getValue();
+                for (Pattern pattern : patterns) {
+                    if (pattern.matcher(header).find()) {
+                        return cdnName;
+                    }
                 }
             }
         }
