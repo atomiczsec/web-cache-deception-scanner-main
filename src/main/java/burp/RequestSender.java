@@ -405,42 +405,27 @@ class RequestSender {
      * Uses Caffeine cache for high-performance caching with TTL.
      */
     protected static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request) {
-        String hostKey = service.getHost();
-        String cacheKey = service.toString() + Arrays.hashCode(request);
+        return retrieveResponseDetails(service, request, 0);
+    }
 
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request, int retryCount) {
+        String hostKey = service.getHost();
+        String cacheKey = buildServiceCacheKey(service, request);
+
+        for (int attempt = retryCount; attempt < MAX_RETRIES; attempt++) {
             try {
+                // Check circuit breaker before doing any work
                 if (isCircuitOpen(hostKey)) {
                     BurpExtender.logDebug("Circuit breaker open for " + hostKey);
                     return null;
                 }
-        return retrieveResponseDetails(service, request, 0);
-    }
-    
-    private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request, int retryCount) {
-        try {
-            String hostKey = service.getHost();
-            String cacheKey = buildServiceCacheKey(service, request);
-            
-            // Check circuit breaker
-            if (isCircuitOpen(hostKey)) {
-                BurpExtender.logDebug("Circuit breaker open for " + hostKey);
-                return null;
-            }
-            
-            // Rate limiting
-            if (!checkRateLimit(hostKey)) {
-                try { Thread.sleep(100); } catch (InterruptedException ignored) {}
-            }
-            
-            // Check cache first
-            Map<String, Object> cached = RESPONSE_CACHE.getIfPresent(cacheKey);
-            if (cached != null) {
-                return cached;
-            }
 
-                waitForRateLimit(hostKey);
+                // Respect host-level rate limiting
+                if (!checkRateLimit(hostKey)) {
+                    waitForRateLimit(hostKey);
+                }
 
+                // Serve from cache when possible
                 Map<String, Object> cached = RESPONSE_CACHE.getIfPresent(cacheKey);
                 if (cached != null) {
                     return cached;
@@ -457,9 +442,8 @@ class RequestSender {
                     recordFailure(hostKey);
                     if (attempt < MAX_RETRIES - 1) {
                         sleepRespectingInterrupts(calculateRetryDelay(attempt));
-                        continue;
                     }
-                    return null;
+                    continue;
                 }
 
                 IResponseInfo responseInfo = BurpExtender.getHelpers().analyzeResponse(response.getResponse());
@@ -468,8 +452,10 @@ class RequestSender {
                 details.put("headers", responseInfo.getHeaders());
                 details.put("responseTime", responseTime);
 
-                byte[] responseBody = java.util.Arrays.copyOfRange(response.getResponse(),
-                    responseInfo.getBodyOffset(), response.getResponse().length);
+                byte[] responseBody = java.util.Arrays.copyOfRange(
+                        response.getResponse(),
+                        responseInfo.getBodyOffset(),
+                        response.getResponse().length);
                 details.put("body", responseBody);
 
                 if (responseInfo.getStatusCode() >= 200 && responseInfo.getStatusCode() < 500) {
