@@ -46,7 +46,8 @@ class RequestSender {
     
     // Rate limiting and circuit breaker state per host
     private static final Map<String, AtomicInteger> REQUEST_COUNTS = new ConcurrentHashMap<>();
-    private static final Map<String, AtomicLong> LAST_REQUEST_TIME = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicLong> RATE_LIMIT_TIMESTAMPS = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicLong> LAST_FAILURE_TIME = new ConcurrentHashMap<>();
     private static final Map<String, AtomicInteger> FAILURE_COUNTS = new ConcurrentHashMap<>();
     private static final int MAX_REQUESTS_PER_SECOND = 10;
     private static final int CIRCUIT_BREAKER_THRESHOLD = 5;
@@ -386,93 +387,79 @@ class RequestSender {
      * Uses Caffeine cache for high-performance caching with TTL.
      */
     protected static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request) {
-        return retrieveResponseDetails(service, request, 0);
-    }
-    
-    private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request, int retryCount) {
-        try {
-            String hostKey = service.getHost();
-            String cacheKey = service.toString() + Arrays.hashCode(request);
-            
-            // Check circuit breaker
-            if (isCircuitOpen(hostKey)) {
-                BurpExtender.logDebug("Circuit breaker open for " + hostKey);
-                return null;
-            }
-            
-            // Rate limiting
-            if (!checkRateLimit(hostKey)) {
-                try { Thread.sleep(100); } catch (InterruptedException ignored) {}
-            }
-            
-            // Check cache first
-            Map<String, Object> cached = RESPONSE_CACHE.getIfPresent(cacheKey);
-            if (cached != null) {
-                return cached;
-            }
+        String hostKey = service.getHost();
+        String cacheKey = service.toString() + Arrays.hashCode(request);
 
-            // Adaptive delay based on host response times
-            long delay = calculateAdaptiveDelay(hostKey);
-            try { Thread.sleep(delay); } catch (InterruptedException ignored) {}
-
-            long startTime = System.currentTimeMillis();
-            IHttpRequestResponse response = BurpExtender.getCallbacks().makeHttpRequest(service, request);
-            long responseTime = System.currentTimeMillis() - startTime;
-            
-            if (response == null) {
-                recordFailure(hostKey);
-                if (retryCount < MAX_RETRIES) {
-                    int delayMs = calculateRetryDelay(retryCount);
-                    try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
-                    return retrieveResponseDetails(service, request, retryCount + 1);
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                if (isCircuitOpen(hostKey)) {
+                    BurpExtender.logDebug("Circuit breaker open for " + hostKey);
+                    return null;
                 }
-                return null;
-            }
 
-            IResponseInfo responseInfo = BurpExtender.getHelpers().analyzeResponse(response.getResponse());
-            Map<String, Object> details = new HashMap<>();
-            details.put("statusCode", (int) responseInfo.getStatusCode());
-            details.put("headers", responseInfo.getHeaders());
-            details.put("responseTime", responseTime);
+                waitForRateLimit(hostKey);
 
-            byte[] responseBody = java.util.Arrays.copyOfRange(response.getResponse(),
-                responseInfo.getBodyOffset(), response.getResponse().length);
-            details.put("body", responseBody);
+                Map<String, Object> cached = RESPONSE_CACHE.getIfPresent(cacheKey);
+                if (cached != null) {
+                    return cached;
+                }
 
-            // Cache successful responses
-            if (responseInfo.getStatusCode() >= 200 && responseInfo.getStatusCode() < 500) {
-                RESPONSE_CACHE.put(cacheKey, details);
-                recordSuccess(hostKey, responseTime);
-            } else {
+                long delay = calculateAdaptiveDelay(hostKey);
+                sleepRespectingInterrupts(delay);
+
+                long startTime = System.currentTimeMillis();
+                IHttpRequestResponse response = BurpExtender.getCallbacks().makeHttpRequest(service, request);
+                long responseTime = System.currentTimeMillis() - startTime;
+
+                if (response == null) {
+                    recordFailure(hostKey);
+                    if (attempt < MAX_RETRIES - 1) {
+                        sleepRespectingInterrupts(calculateRetryDelay(attempt));
+                        continue;
+                    }
+                    return null;
+                }
+
+                IResponseInfo responseInfo = BurpExtender.getHelpers().analyzeResponse(response.getResponse());
+                Map<String, Object> details = new HashMap<>();
+                details.put("statusCode", (int) responseInfo.getStatusCode());
+                details.put("headers", responseInfo.getHeaders());
+                details.put("responseTime", responseTime);
+
+                byte[] responseBody = java.util.Arrays.copyOfRange(response.getResponse(),
+                    responseInfo.getBodyOffset(), response.getResponse().length);
+                details.put("body", responseBody);
+
+                if (responseInfo.getStatusCode() >= 200 && responseInfo.getStatusCode() < 500) {
+                    RESPONSE_CACHE.put(cacheKey, details);
+                    recordSuccess(hostKey, responseTime);
+                } else {
+                    recordFailure(hostKey);
+                }
+
+                return details;
+            } catch (Exception e) {
                 recordFailure(hostKey);
+                if (attempt < MAX_RETRIES - 1) {
+                    sleepRespectingInterrupts(calculateRetryDelay(attempt));
+                }
             }
-            
-            return details;
-        } catch (Exception e) {
-            String hostKey = service.getHost();
-            recordFailure(hostKey);
-            if (retryCount < MAX_RETRIES) {
-                int delayMs = calculateRetryDelay(retryCount);
-                try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
-                return retrieveResponseDetails(service, request, retryCount + 1);
-            }
-            return null;
         }
+
+        return null;
     }
     
     private static boolean isCircuitOpen(String hostKey) {
         AtomicInteger failures = FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0));
         if (failures.get() >= CIRCUIT_BREAKER_THRESHOLD) {
-            AtomicLong lastFailure = LAST_REQUEST_TIME.get(hostKey);
+            AtomicLong lastFailure = LAST_FAILURE_TIME.get(hostKey);
             if (lastFailure == null) {
-                // No failure time recorded yet, circuit should not be open
                 return false;
             }
             long timeSinceLastFailure = System.currentTimeMillis() - lastFailure.get();
             if (timeSinceLastFailure < CIRCUIT_BREAKER_RESET_MS) {
                 return true;
             } else {
-                // Reset circuit breaker after reset period has elapsed
                 failures.set(0);
             }
         }
@@ -481,28 +468,27 @@ class RequestSender {
     
     private static boolean checkRateLimit(String hostKey) {
         AtomicInteger count = REQUEST_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0));
-        AtomicLong lastTime = LAST_REQUEST_TIME.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis()));
-        
+        AtomicLong lastTime = RATE_LIMIT_TIMESTAMPS.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis()));
+
         long currentTime = System.currentTimeMillis();
         long timeDiff = currentTime - lastTime.get();
-        
+
         if (timeDiff >= 1000) {
-            // Reset counter every second
             count.set(0);
-            lastTime.set(currentTime);
         }
-        
+
         if (count.get() >= MAX_REQUESTS_PER_SECOND) {
             return false;
         }
-        
+
         count.incrementAndGet();
+        lastTime.set(currentTime);
         return true;
     }
-    
+
     private static long calculateAdaptiveDelay(String hostKey) {
         // Start with base delay, adjust based on response times
-        AtomicLong lastTime = LAST_REQUEST_TIME.get(hostKey);
+        AtomicLong lastTime = RATE_LIMIT_TIMESTAMPS.get(hostKey);
         if (lastTime == null) {
             return 50; // Base delay
         }
@@ -522,7 +508,24 @@ class RequestSender {
     
     private static void recordFailure(String hostKey) {
         FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0)).incrementAndGet();
-        LAST_REQUEST_TIME.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis())).set(System.currentTimeMillis());
+        LAST_FAILURE_TIME.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis())).set(System.currentTimeMillis());
+    }
+
+    private static void waitForRateLimit(String hostKey) {
+        while (!checkRateLimit(hostKey)) {
+            sleepRespectingInterrupts(100);
+        }
+    }
+
+    private static void sleepRespectingInterrupts(long delayMs) {
+        if (delayMs <= 0) {
+            return;
+        }
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
