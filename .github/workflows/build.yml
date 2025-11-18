@@ -44,7 +44,23 @@ jobs:
         name: extension-jar
         path: build/libs/*.jar
         retention-days: 30
-    
+
+    - name: Update latest release with build
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: ncipollo/release-action@v1
+      with:
+        tag: latest
+        name: Latest build
+        artifacts: build/libs/*.jar
+        allowUpdates: true
+        replacesArtifacts: true
+        body: |
+          ## Latest Web Cache Deception Scanner build
+
+          Built automatically from `${{ github.ref_name }}` at `${{ github.sha }}`.
+
+          Download the attached `web-cache-deception-scanner-all.jar` to install the most recent extension in Burp Suite.
+
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v1
