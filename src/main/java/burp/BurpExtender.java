@@ -73,8 +73,7 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
         callbacks.setExtensionName("Web Cache Deception Scanner");
         callbacks.registerContextMenuFactory(this);
         callbacks.registerExtensionStateListener(this);
-        printStatus("Version " + VERSION + " loaded");
-
+        
         helpers = iBurpExtenderCallbacks.getHelpers();
 
         // Initialize performance configuration
@@ -89,8 +88,8 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 new ThreadPoolExecutor.CallerRunsPolicy());
         executor.allowCoreThreadTimeOut(false);
         
-        // Log system info and configuration
-        logInfo("Version " + VERSION + " loaded");
+        // Log version and configuration (single formatted output)
+        printStatus("Version " + VERSION + " loaded");
         logInfo(PerformanceConfig.getSystemInfo());
         logInfo(PerformanceConfig.getConfigSummary());
         logInfo("Thread pool size: " + parallelism + " threads");

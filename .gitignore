@@ -50,3 +50,5 @@ bin/
 /dist/
 /nbdist/
 /.nb-gradle/
+DEVELOPMENT.md
+docs/DEVELOPMENT.md
