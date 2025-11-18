@@ -107,12 +107,10 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
     public List<JMenuItem> createMenuItems(IContextMenuInvocation iContextMenuInvocation) {
         List<JMenuItem> items = new ArrayList<>();
 
-        if (IContextMenuInvocation.CONTEXT_TARGET_SITE_MAP_TABLE == iContextMenuInvocation.getInvocationContext() ||
-                IContextMenuInvocation.CONTEXT_TARGET_SITE_MAP_TREE == iContextMenuInvocation.getInvocationContext() ||
-                IContextMenuInvocation.CONTEXT_PROXY_HISTORY == iContextMenuInvocation.getInvocationContext()) {
-            IHttpRequestResponse[] arr = iContextMenuInvocation.getSelectedMessages();
+        IHttpRequestResponse[] selectedMessages = iContextMenuInvocation.getSelectedMessages();
+        if (selectedMessages != null && selectedMessages.length > 0) {
             JMenuItem item = new JMenuItem("Web Cache Deception Test");
-            MenuItemListener mil = new MenuItemListener(arr);
+            MenuItemListener mil = new MenuItemListener(selectedMessages);
             item.addActionListener(mil);
             items.add(item);
         }
