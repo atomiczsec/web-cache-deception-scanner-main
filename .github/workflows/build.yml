@@ -95,13 +95,6 @@ jobs:
           2. In Burp Suite, go to **Extender** tab
           3. Click **Add** and select the JAR file
           4. Check the **Output** tab for loading confirmation
-
-          ### Features
-          - Advanced cache deception detection
-          - Multiple attack vectors (delimiters, headers, HPP, unicode, case sensitivity)
-          - CDN fingerprinting
-          - High-performance caching with Caffeine
-          - Circuit breaker and rate limiting
         draft: false
         prerelease: false
       env:
@@ -124,13 +117,6 @@ jobs:
           2. In Burp Suite, go to **Extender** tab
           3. Click **Add** and select the JAR file
           4. Check the **Output** tab for loading confirmation
-          
-          ### Features
-          - Advanced cache deception detection
-          - Multiple attack vectors (delimiters, headers, HPP, unicode, case sensitivity)
-          - CDN fingerprinting
-          - High-performance caching with Caffeine
-          - Circuit breaker and rate limiting
         draft: false
         prerelease: false
       env:
