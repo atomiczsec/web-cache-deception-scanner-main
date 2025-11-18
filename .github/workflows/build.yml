@@ -3,6 +3,8 @@ name: Build Extension
 on:
   push:
     branches: [ main, master ]
+    paths:
+      - 'src/**/*.java'
     tags:
       - 'v*'
   pull_request:
@@ -47,21 +49,63 @@ jobs:
         path: build/libs/*.jar
         retention-days: 30
 
-    - name: Update latest release with build
+    - name: Get latest release version and increment
       if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-      uses: ncipollo/release-action@v1
+      id: get_next_version
+      run: |
+        # Get all releases and extract version numbers, excluding 'latest' tag
+        RELEASES=$(gh release list --limit 100 --json tagName)
+        
+        # Extract version numbers (format: v2.0, v2.1, etc.), exclude 'latest', and find the highest
+        LATEST_VERSION=$(echo "$RELEASES" | jq -r '.[].tagName' | grep -vE '^latest$' | grep -E '^v[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -t. -k1,1nr -k2,2nr | head -n1)
+        
+        # If no releases exist, start with 2.0
+        if [ -z "$LATEST_VERSION" ]; then
+          LATEST_VERSION="2.0"
+        fi
+        
+        # Increment minor version (e.g., 2.0 -> 2.1, 2.1 -> 2.2)
+        MAJOR=$(echo "$LATEST_VERSION" | cut -d. -f1)
+        MINOR=$(echo "$LATEST_VERSION" | cut -d. -f2)
+        NEW_MINOR=$((MINOR + 1))
+        NEW_VERSION="${MAJOR}.${NEW_MINOR}"
+        
+        echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+        echo "Latest version: $LATEST_VERSION"
+        echo "New version: $NEW_VERSION"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create new auto-versioned release
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: softprops/action-gh-release@v1
       with:
-        tag: latest
-        name: Latest build
-        artifacts: build/libs/*.jar
-        allowUpdates: true
-        replacesArtifacts: true
+        tag_name: ${{ steps.get_next_version.outputs.tag }}
+        name: Release v${{ steps.get_next_version.outputs.new_version }}
+        files: build/libs/*.jar
         body: |
-          ## Latest Web Cache Deception Scanner build
+          ## Web Cache Deception Scanner v${{ steps.get_next_version.outputs.new_version }}
 
           Built automatically from `${{ github.ref_name }}` at `${{ github.sha }}`.
 
-          Download the attached `web-cache-deception-scanner-all.jar` to install the most recent extension in Burp Suite.
+          ### Installation
+          1. Download the `web-cache-deception-scanner-all.jar` file
+          2. In Burp Suite, go to **Extender** tab
+          3. Click **Add** and select the JAR file
+          4. Check the **Output** tab for loading confirmation
+
+          ### Features
+          - Advanced cache deception detection
+          - Multiple attack vectors (delimiters, headers, HPP, unicode, case sensitivity)
+          - CDN fingerprinting
+          - High-performance caching with Caffeine
+          - Circuit breaker and rate limiting
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/v')
