@@ -260,9 +260,12 @@ class RequestSender {
             }
         }
 
-        // Neither simple appending nor normalization patterns worked
-        BurpExtender.logDebug("Initial test failed: Neither appended segments nor normalization patterns returned similar content");
-        return InitialTestResult.failure("Backend rejects extra path segments and normalization patterns");
+        // Neither simple appending nor normalization patterns worked at the backend level
+        // However, cache normalization discrepancies can still be exploited even if the backend
+        // doesn't normalize. We'll allow testing to continue - the cache-specific tests will
+        // catch vulnerabilities where the cache normalizes but the backend doesn't.
+        BurpExtender.logDebug("Backend doesn't normalize paths, but continuing scan for cache normalization discrepancies");
+        return InitialTestResult.success(randomSegment);
     }
 
     /**
