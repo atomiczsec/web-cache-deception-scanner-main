@@ -139,11 +139,13 @@ class RequestSender {
     private static final Pattern UUID_PATTERN = Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", Pattern.CASE_INSENSITIVE);
 
     /**
-     * Initial test to check if the application ignores trailing path segments.
-     * This is a prerequisite for cache deception - the backend must ignore trailing segments.
+     * Initial test to check if the application ignores trailing path segments or supports normalization.
+     * This is a prerequisite for cache deception - the backend must ignore trailing segments or support normalization.
      * Returns true only if:
      * 1. Authenticated and unauthenticated responses are DIFFERENT (confirms auth is required)
-     * 2. Authenticated response with appended segment is SIMILAR to original (confirms backend ignores trailing segments)
+     * 2. Either:
+     *    a. Appended path returns 200 with SIMILAR content (confirms backend ignores trailing segments), OR
+     *    b. Normalization pattern returns 200 with SIMILAR content (confirms normalization-based cache deception possible)
      */
     protected static InitialTestResult initialTest(IHttpRequestResponse message) {
         byte[] orgRequest = buildHttpRequest(message, null, null, true);
@@ -178,32 +180,86 @@ class RequestSender {
             return InitialTestResult.failure("Endpoint looks public (auth vs unauth are similar)");
         }
 
-        // Step 2: Verify that appending a random segment returns SIMILAR content
-        // This confirms the backend ignores trailing path segments (prerequisite for cache deception)
+        // Step 2a: Try simple appending first (e.g., /my-account/abc)
+        // 404 is expected and indicates origin server doesn't abstract the path - this is OK
         String randomSegment = generateRandomString(5);
         byte[] testRequest = buildHttpRequestWithSegment(message, randomSegment, null, true, "/");
         Map<String, Object> appendedDetails = retrieveResponseDetails(message.getHttpService(), testRequest);
-        if (appendedDetails == null) {
-            return InitialTestResult.failure("Unable to fetch appended path response");
+        if (appendedDetails != null) {
+            int appendedStatusCode = (int) appendedDetails.get("statusCode");
+            if (appendedStatusCode >= 200 && appendedStatusCode < 300) {
+                // Simple appending worked - check similarity
+                byte[] appendedBody = (byte[]) appendedDetails.get("body");
+                Map<String, Object> step2Similarity = testSimilar(
+                        bytesToString(originalAuthBody, orgDetails),
+                        bytesToString(appendedBody, appendedDetails));
+                boolean appendIsSimilar = (boolean) step2Similarity.get("similar");
+                
+                if (appendIsSimilar) {
+                    // Simple appending works - backend ignores trailing segments
+                    return InitialTestResult.success(randomSegment);
+                }
+            } else if (appendedStatusCode == 404) {
+                // 404 is expected - indicates origin server doesn't abstract the path
+                // This is fine, we'll try normalization patterns next
+                BurpExtender.logDebug("Appended path returned 404 (expected) - trying normalization patterns");
+            }
         }
-        int appendedStatusCode = (int) appendedDetails.get("statusCode");
-        if (appendedStatusCode < 200 || appendedStatusCode >= 300) {
-            return InitialTestResult.failure("Appended path returned status " + appendedStatusCode);
+
+        // Step 2b: Try normalization patterns (e.g., /aaa/..%2fmy-account)
+        // This tests if normalization discrepancies can be exploited
+        IRequestInfo reqInfo = BurpExtender.getHelpers().analyzeRequest(message);
+        String targetPath = reqInfo.getUrl().getPath();
+        if (targetPath == null || targetPath.isEmpty() || !targetPath.startsWith("/")) {
+            return InitialTestResult.failure("Invalid target path");
         }
-        byte[] appendedBody = (byte[]) appendedDetails.get("body");
-
-        Map<String, Object> step2Similarity = testSimilar(
-                bytesToString(originalAuthBody, orgDetails),
-                bytesToString(appendedBody, appendedDetails));
-        boolean appendIsSimilar = (boolean) step2Similarity.get("similar");
-
-        if (!appendIsSimilar) {
-            BurpExtender.logDebug("Initial test failed: Appended segment response not similar to original");
-            return InitialTestResult.failure("Backend rejects extra path segments");
+        
+        // Extract the path without leading slash for normalization pattern
+        String pathWithoutSlash = targetPath.substring(1);
+        
+        // Test normalization patterns with different traversal patterns
+        // Pattern: /{arbitraryDir}/{traversal}{originalPath}
+        // Example: /aaa/..%2fmy-account normalizes to /my-account
+        String[] traversalPatterns = {"..%2f", "%2f%2e%2e%2f", "%2e%2e%2f"};
+        String[] arbitraryDirs = {"aaa", "test", "xyz", "dir"};
+        
+        for (String traversal : traversalPatterns) {
+            for (String dir : arbitraryDirs) {
+                // Build pattern: /{arbitraryDir}/{traversal}{originalPath}
+                // Example: /aaa/..%2fmy-account
+                String normalizationPath = "/" + dir + "/" + traversal + pathWithoutSlash;
+                
+                byte[] normRequest = buildHttpRequestWithFullPath(message, true, normalizationPath);
+                if (normRequest == null) {
+                    continue;
+                }
+                
+                Map<String, Object> normDetails = retrieveResponseDetails(message.getHttpService(), normRequest);
+                if (normDetails == null) {
+                    continue;
+                }
+                
+                int normStatusCode = (int) normDetails.get("statusCode");
+                if (normStatusCode >= 200 && normStatusCode < 300) {
+                    // Normalization pattern returned 200 - check similarity
+                    byte[] normBody = (byte[]) normDetails.get("body");
+                    Map<String, Object> normSimilarity = testSimilar(
+                            bytesToString(originalAuthBody, orgDetails),
+                            bytesToString(normBody, normDetails));
+                    boolean normIsSimilar = (boolean) normSimilarity.get("similar");
+                    
+                    if (normIsSimilar) {
+                        // Normalization pattern works - cache deception via normalization is possible
+                        BurpExtender.logDebug("Normalization pattern successful: " + normalizationPath);
+                        return InitialTestResult.success(randomSegment);
+                    }
+                }
+            }
         }
 
-        // Both conditions met: auth required AND backend ignores trailing segments
-        return InitialTestResult.success(randomSegment);
+        // Neither simple appending nor normalization patterns worked
+        BurpExtender.logDebug("Initial test failed: Neither appended segments nor normalization patterns returned similar content");
+        return InitialTestResult.failure("Backend rejects extra path segments and normalization patterns");
     }
 
     /**
