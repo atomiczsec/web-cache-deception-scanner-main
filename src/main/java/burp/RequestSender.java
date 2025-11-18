@@ -500,7 +500,7 @@ class RequestSender {
                 IHttpRequestResponse response = BurpExtender.getCallbacks().makeHttpRequest(service, request);
                 long responseTime = System.currentTimeMillis() - startTime;
 
-                if (response == null) {
+                if (response == null || response.getResponse() == null) {
                     recordFailure(hostKey);
                     if (attempt < MAX_RETRIES - 1) {
                         sleepRespectingInterrupts(calculateRetryDelay(attempt));
