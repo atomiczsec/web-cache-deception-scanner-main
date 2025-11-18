@@ -33,8 +33,6 @@ class RequestSender {
     // Levenshtein: 300 = max edit distance (raised from 200 to account for dynamic content)
     private final static double   JARO_THRESHOLD = 0.75;
     private final static int      LEVENSHTEIN_THRESHOLD = 300;
-    private final static int      CACHE_MAX_SIZE = 1000; // Maximum cache entries
-    private final static int      CACHE_TTL_SECONDS = 300; // 5 minutes TTL
     private final static int      MAX_RETRIES = 3;
     private final static int      REQUEST_TIMEOUT_MS = 10000; // 10 seconds
     private final static int      MIN_RETRY_DELAY_MS = 100;
@@ -45,10 +43,10 @@ class RequestSender {
     private static final JaroWinklerSimilarity JARO_WINKLER = new JaroWinklerSimilarity();
     private static final LevenshteinDistance LEVENSHTEIN = new LevenshteinDistance();
     
-    // High-performance Caffeine cache with TTL
+    // High-performance Caffeine cache with TTL - configured via PerformanceConfig
     private static final Cache<String, Map<String, Object>> RESPONSE_CACHE = Caffeine.newBuilder()
-            .maximumSize(CACHE_MAX_SIZE)
-            .expireAfterWrite(CACHE_TTL_SECONDS, TimeUnit.SECONDS)
+            .maximumSize(PerformanceConfig.getCacheMaxSize())
+            .expireAfterWrite(PerformanceConfig.getCacheTTLSeconds(), TimeUnit.SECONDS)
             .build();
     
     // Rate limiting and circuit breaker state per host
@@ -56,9 +54,14 @@ class RequestSender {
     private static final Map<String, AtomicLong> RATE_LIMIT_TIMESTAMPS = new ConcurrentHashMap<>();
     private static final Map<String, AtomicLong> LAST_FAILURE_TIME = new ConcurrentHashMap<>();
     private static final Map<String, AtomicInteger> FAILURE_COUNTS = new ConcurrentHashMap<>();
-    private static final int MAX_REQUESTS_PER_SECOND = 10;
+    // Rate limit configured via PerformanceConfig
     private static final int CIRCUIT_BREAKER_THRESHOLD = 5;
     private static final long CIRCUIT_BREAKER_RESET_MS = 60000; // 1 minute
+    
+    // Get rate limit from PerformanceConfig
+    private static int getMaxRequestsPerSecond() {
+        return PerformanceConfig.getRateLimit();
+    }
 
     // Expanded list of potential cache targets
     protected final static String[] KNOWN_CACHEABLE_PATHS = {
@@ -583,7 +586,7 @@ class RequestSender {
             count.set(0);
         }
 
-        if (count.get() >= MAX_REQUESTS_PER_SECOND) {
+        if (count.get() >= getMaxRequestsPerSecond()) {
             return false;
         }
 
@@ -769,7 +772,7 @@ class RequestSender {
             return false;
         }
 
-        try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
         byte[] requestBytes2 = requestBytes1;
         Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
         if (details2 == null) {
@@ -879,7 +882,7 @@ class RequestSender {
 
         // --- Second Request --- 
         // Introduce a small delay - sometimes caches need a moment
-        try { Thread.sleep(100); } catch (InterruptedException ignored) {} 
+        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {} 
         byte[] requestBytes2 = requestBytes1; // Re-use
         Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
         if (details2 == null) return false;
@@ -1020,7 +1023,7 @@ class RequestSender {
             return false;
         }
 
-        try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
         byte[] requestBytes2 = requestBytes1;
         Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
         if (details2 == null) {
@@ -1136,7 +1139,7 @@ class RequestSender {
             return false;
         }
         
-        try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
         byte[] requestBytes2 = requestBytes1;
         Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
         if (details2 == null) {
@@ -1370,7 +1373,7 @@ class RequestSender {
         int similarResponses = 0;
         
         for (int i = 0; i < rounds; i++) {
-            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
             
             Map<String, Object> details = retrieveResponseDetails(message.getHttpService(), testRequest);
             if (details == null) continue;

