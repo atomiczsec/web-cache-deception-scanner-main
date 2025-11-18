@@ -151,11 +151,16 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                 
                 updateStatus("Initializing...");
                 long initStart = System.currentTimeMillis();
-                String initialRandomSegment = RequestSender.initialTest(reqRes);
-                if (initialRandomSegment == null) {
-                    logWarning("Scan aborted: Initial path mapping tests failed");
+                RequestSender.InitialTestResult initialTestResult = RequestSender.initialTest(reqRes);
+                if (initialTestResult == null || !initialTestResult.isSuccess()) {
+                    String reason = initialTestResult != null
+                            ? initialTestResult.getFailureReason()
+                            : "Initial path mapping tests failed";
+                    logWarning("Scan aborted: " + reason);
+                    updateStatus("Scan aborted: " + reason);
                     return;
                 }
+                String initialRandomSegment = initialTestResult.getRandomSegment();
                 logTiming("Initialization", System.currentTimeMillis() - initStart);
                 
                 // Detect CDN/cache layer
