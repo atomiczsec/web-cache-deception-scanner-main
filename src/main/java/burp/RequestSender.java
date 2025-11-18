@@ -145,15 +145,15 @@ class RequestSender {
      * 1. Authenticated and unauthenticated responses are DIFFERENT (confirms auth is required)
      * 2. Authenticated response with appended segment is SIMILAR to original (confirms backend ignores trailing segments)
      */
-    protected static String initialTest(IHttpRequestResponse message) {
+    protected static InitialTestResult initialTest(IHttpRequestResponse message) {
         byte[] orgRequest = buildHttpRequest(message, null, null, true);
         Map<String, Object> orgDetails = retrieveResponseDetails(message.getHttpService(), orgRequest);
         if (orgDetails == null) {
-            return null;
+            return InitialTestResult.failure("Unable to fetch the original authenticated response");
         }
         int orgStatusCode = (int) orgDetails.get("statusCode");
         if (orgStatusCode < 200 || orgStatusCode >= 300) {
-            return null; // Original request must succeed
+            return InitialTestResult.failure("Original request returned status " + orgStatusCode);
         }
         byte[] originalAuthBody = (byte[]) orgDetails.get("body");
 
@@ -162,7 +162,7 @@ class RequestSender {
         byte[] unAuthedRequest = buildHttpRequest(message, null, null, false);
         Map<String, Object> unauthDetails = retrieveResponseDetails(message.getHttpService(), unAuthedRequest);
         if (unauthDetails == null) {
-            return null;
+            return InitialTestResult.failure("Unable to fetch unauthenticated response");
         }
         int unauthStatusCode = (int) unauthDetails.get("statusCode");
         byte[] unauthBody = (byte[]) unauthDetails.get("body");
@@ -175,7 +175,7 @@ class RequestSender {
         // If unauthenticated response is similar, this endpoint doesn't require auth - skip it
         if (unauthedIsSimilar) {
             BurpExtender.logDebug("Initial test failed: Unauthenticated response similar to authenticated");
-            return null;
+            return InitialTestResult.failure("Endpoint looks public (auth vs unauth are similar)");
         }
 
         // Step 2: Verify that appending a random segment returns SIMILAR content
@@ -184,11 +184,11 @@ class RequestSender {
         byte[] testRequest = buildHttpRequestWithSegment(message, randomSegment, null, true, "/");
         Map<String, Object> appendedDetails = retrieveResponseDetails(message.getHttpService(), testRequest);
         if (appendedDetails == null) {
-            return null;
+            return InitialTestResult.failure("Unable to fetch appended path response");
         }
         int appendedStatusCode = (int) appendedDetails.get("statusCode");
         if (appendedStatusCode < 200 || appendedStatusCode >= 300) {
-            return null; // Appended request must also succeed
+            return InitialTestResult.failure("Appended path returned status " + appendedStatusCode);
         }
         byte[] appendedBody = (byte[]) appendedDetails.get("body");
 
@@ -199,11 +199,11 @@ class RequestSender {
 
         if (!appendIsSimilar) {
             BurpExtender.logDebug("Initial test failed: Appended segment response not similar to original");
-            return null;
+            return InitialTestResult.failure("Backend rejects extra path segments");
         }
 
         // Both conditions met: auth required AND backend ignores trailing segments
-        return randomSegment;
+        return InitialTestResult.success(randomSegment);
     }
 
     /**
@@ -1480,6 +1480,38 @@ class RequestSender {
                 finalHeaders.add(header);
             }
             return BurpExtender.getHelpers().buildHttpMessage(finalHeaders, body);
+        }
+    }
+
+    protected static final class InitialTestResult {
+        private final boolean success;
+        private final String randomSegment;
+        private final String failureReason;
+
+        private InitialTestResult(boolean success, String randomSegment, String failureReason) {
+            this.success = success;
+            this.randomSegment = randomSegment;
+            this.failureReason = failureReason;
+        }
+
+        protected static InitialTestResult success(String randomSegment) {
+            return new InitialTestResult(true, randomSegment, null);
+        }
+
+        protected static InitialTestResult failure(String reason) {
+            return new InitialTestResult(false, null, reason);
+        }
+
+        protected boolean isSuccess() {
+            return success;
+        }
+
+        protected String getRandomSegment() {
+            return randomSegment;
+        }
+
+        protected String getFailureReason() {
+            return failureReason;
         }
     }
 }
