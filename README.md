@@ -22,18 +22,7 @@ This is a Burp Suite extension to test web applications for various Web Cache De
 
 ## Installation (Community Edition)
 
-1.  Build the extension JAR as described above.
-2.  In Burp Suite Community, go to the **Extender** tab.
-3.  Under the **Extensions** sub-tab, click the **Add** button.
-4.  Set **Extension type** to **Java**.
-5.  Click **Select file...** and choose the `web-cache-deception-scanner-all.jar` file from the `build/libs` directory.
-6.  Click **Next**.
-7.  Check the **Output** tab for the loading messages and credits:
-    ```
-    Web Cache Deception Scanner Version 1.2
-    Original Author: Johan Snyman <jsnyman@trustwave.com>
-    Updated for Burp Community by: atomiczsec <https://atomiczsec.net>
-    ```
+{updating, work in progress}
 
 ## Credits
 
