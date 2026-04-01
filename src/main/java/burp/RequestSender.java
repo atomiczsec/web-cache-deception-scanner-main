@@ -17,7 +17,6 @@ import java.util.regex.Pattern;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Arrays;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.LinkedHashMap;
 import java.util.Set;
 import java.util.HashSet;
@@ -49,11 +48,22 @@ class RequestSender {
             .expireAfterWrite(PerformanceConfig.getCacheTTLSeconds(), TimeUnit.SECONDS)
             .build();
     
-    // Rate limiting and circuit breaker state per host
-    private static final Map<String, AtomicInteger> REQUEST_COUNTS = new ConcurrentHashMap<>();
-    private static final Map<String, AtomicLong> RATE_LIMIT_TIMESTAMPS = new ConcurrentHashMap<>();
-    private static final Map<String, AtomicLong> LAST_FAILURE_TIME = new ConcurrentHashMap<>();
-    private static final Map<String, AtomicInteger> FAILURE_COUNTS = new ConcurrentHashMap<>();
+    // Per-host state: bounded Caffeine cache to prevent unbounded memory growth when
+    // scanning many distinct hosts in a long-running Burp session.
+    private static final class HostState {
+        final AtomicInteger failureCount      = new AtomicInteger(0);
+        final AtomicLong    lastFailureTime   = new AtomicLong(0);
+        final AtomicInteger requestCount      = new AtomicInteger(0);
+        final AtomicLong    rateLimitTimestamp = new AtomicLong(System.currentTimeMillis());
+    }
+    // Max 1 000 hosts; entries expire 10 min after last access, bounding memory regardless of scan breadth.
+    private static final Cache<String, HostState> HOST_STATE_CACHE = Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterAccess(10, TimeUnit.MINUTES)
+            .build();
+    private static HostState getHostState(String hostKey) {
+        return HOST_STATE_CACHE.get(hostKey, k -> new HostState());
+    }
     // Rate limit configured via PerformanceConfig
     private static final int CIRCUIT_BREAKER_THRESHOLD = 5;
     private static final long CIRCUIT_BREAKER_RESET_MS = 60000; // 1 minute
@@ -557,70 +567,62 @@ class RequestSender {
             port = "https".equals(protocol) ? 443 : 80;
         }
 
-        String serviceKey = protocol + "://" + host + ":" + port;
-        return serviceKey + "|" + Arrays.hashCode(request);
+        return new StringBuilder(protocol.length() + host.length() + 20)
+                .append(protocol).append("://").append(host).append(':').append(port)
+                .append('|').append(Arrays.hashCode(request))
+                .toString();
     }
     
     private static boolean isCircuitOpen(String hostKey) {
-        AtomicInteger failures = FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0));
-        if (failures.get() >= CIRCUIT_BREAKER_THRESHOLD) {
-            AtomicLong lastFailure = LAST_FAILURE_TIME.get(hostKey);
-            if (lastFailure == null) {
-                return false;
-            }
-            long timeSinceLastFailure = System.currentTimeMillis() - lastFailure.get();
+        HostState state = getHostState(hostKey);
+        if (state.failureCount.get() >= CIRCUIT_BREAKER_THRESHOLD) {
+            long timeSinceLastFailure = System.currentTimeMillis() - state.lastFailureTime.get();
             if (timeSinceLastFailure < CIRCUIT_BREAKER_RESET_MS) {
                 return true;
             } else {
-                failures.set(0);
+                state.failureCount.set(0);
             }
         }
         return false;
     }
-    
-    private static boolean checkRateLimit(String hostKey) {
-        AtomicInteger count = REQUEST_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0));
-        AtomicLong lastTime = RATE_LIMIT_TIMESTAMPS.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis()));
 
+    private static boolean checkRateLimit(String hostKey) {
+        HostState state = getHostState(hostKey);
         long currentTime = System.currentTimeMillis();
-        long timeDiff = currentTime - lastTime.get();
+        long timeDiff = currentTime - state.rateLimitTimestamp.get();
 
         if (timeDiff >= 1000) {
-            count.set(0);
+            state.requestCount.set(0);
         }
 
-        if (count.get() >= getMaxRequestsPerSecond()) {
+        if (state.requestCount.get() >= getMaxRequestsPerSecond()) {
             return false;
         }
 
-        count.incrementAndGet();
-        lastTime.set(currentTime);
+        state.requestCount.incrementAndGet();
+        state.rateLimitTimestamp.set(currentTime);
         return true;
     }
 
     private static long calculateAdaptiveDelay(String hostKey) {
-        // Start with base delay, adjust based on response times
-        AtomicLong lastTime = RATE_LIMIT_TIMESTAMPS.get(hostKey);
-        if (lastTime == null) {
-            return 50; // Base delay
-        }
         // Could be enhanced to track average response times
         return 50;
     }
-    
+
     private static int calculateRetryDelay(int retryCount) {
         // Exponential backoff
         int delay = MIN_RETRY_DELAY_MS * (1 << retryCount);
         return Math.min(delay, MAX_RETRY_DELAY_MS);
     }
-    
+
     private static void recordSuccess(String hostKey, long responseTime) {
-        FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0)).set(0);
+        getHostState(hostKey).failureCount.set(0);
     }
-    
+
     private static void recordFailure(String hostKey) {
-        FAILURE_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0)).incrementAndGet();
-        LAST_FAILURE_TIME.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis())).set(System.currentTimeMillis());
+        HostState state = getHostState(hostKey);
+        state.failureCount.incrementAndGet();
+        state.lastFailureTime.set(System.currentTimeMillis());
     }
 
     private static void waitForRateLimit(String hostKey) {
