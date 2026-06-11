@@ -336,14 +336,13 @@ public class BurpExtender implements IBurpExtender, IContextMenuFactory, IExtens
                     }
                 }
 
-                // Only run medium/low priority tests if no high-severity vulnerabilities found yet
-                // (hasHighSeverityVuln already checked above, but check again after medium tests)
-                boolean stillNoHighSeverityVuln = hashTraversalVulnerable || 
+                // Only run low-priority tests if no high/medium severity vulnerabilities found
+                boolean hasSignificantVuln = hashTraversalVulnerable || 
                                             !successfulSelfRefExploits.isEmpty() || 
                                             !successfulReverseTraversals.isEmpty() ||
                                             !successfulHeaderAttacks.isEmpty();
                 
-                if (!stillNoHighSeverityVuln) {
+                if (!hasSignificantVuln) {
                     updateStatus("Testing path normalization...");
                     // Prioritize common cacheable paths and templates
                     List<String> priorityPaths = Arrays.asList("/robots.txt", "/favicon.ico", "/", "/index.html");

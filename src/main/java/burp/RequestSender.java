@@ -11,14 +11,14 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.LinkedHashMap;
+
 import java.util.Set;
 import java.util.HashSet;
 import java.util.concurrent.TimeUnit;
@@ -40,8 +40,9 @@ class RequestSender {
     private static final Charset  DEFAULT_CHARSET = StandardCharsets.ISO_8859_1;
     private static final Pattern  CHARSET_PATTERN = Pattern.compile("charset=([^;\\s]+)", Pattern.CASE_INSENSITIVE);
     private static final Pattern  SCRIPT_TAG_PATTERN = Pattern.compile("<script[^>]*>.*?</script>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final int MAX_BODY_SIZE_FOR_COMPARISON = 200_000; // 200KB cap for similarity
     private static final JaroWinklerSimilarity JARO_WINKLER = new JaroWinklerSimilarity();
-    private static final LevenshteinDistance LEVENSHTEIN = new LevenshteinDistance();
+    private static final LevenshteinDistance LEVENSHTEIN = new LevenshteinDistance(LEVENSHTEIN_THRESHOLD);
     
     // High-performance Caffeine cache with TTL - configured via PerformanceConfig
     private static final Cache<String, Map<String, Object>> RESPONSE_CACHE = Caffeine.newBuilder()
@@ -50,8 +51,8 @@ class RequestSender {
             .build();
     
     // Rate limiting and circuit breaker state per host
-    private static final Map<String, AtomicInteger> REQUEST_COUNTS = new ConcurrentHashMap<>();
-    private static final Map<String, AtomicLong> RATE_LIMIT_TIMESTAMPS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, AtomicInteger> REQUEST_COUNTS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, AtomicLong> RATE_LIMIT_TIMESTAMPS = new ConcurrentHashMap<>();
     private static final Map<String, AtomicLong> LAST_FAILURE_TIME = new ConcurrentHashMap<>();
     private static final Map<String, AtomicInteger> FAILURE_COUNTS = new ConcurrentHashMap<>();
     // Rate limit configured via PerformanceConfig
@@ -470,6 +471,74 @@ class RequestSender {
         return retrieveResponseDetails(service, request, 0);
     }
 
+    /**
+     * Retrieves response details bypassing the local Caffeine cache.
+     * Required for two-phase cache tests where the second request must actually
+     * hit the remote server to observe X-Cache transitions (miss → hit).
+     */
+    protected static Map<String, Object> retrieveResponseDetailsNoCache(IHttpService service, byte[] request) {
+        return retrieveResponseDetailsNoCache(service, request, 0);
+    }
+
+    private static Map<String, Object> retrieveResponseDetailsNoCache(IHttpService service, byte[] request, int retryCount) {
+        String hostKey = service.getHost();
+
+        for (int attempt = retryCount; attempt < MAX_RETRIES; attempt++) {
+            try {
+                if (isCircuitOpen(hostKey)) {
+                    BurpExtender.logDebug("Circuit breaker open for " + hostKey);
+                    return null;
+                }
+
+                if (!checkRateLimit(hostKey)) {
+                    waitForRateLimit(hostKey);
+                }
+
+                long delay = calculateAdaptiveDelay(hostKey);
+                sleepRespectingInterrupts(delay);
+
+                long startTime = System.currentTimeMillis();
+                IHttpRequestResponse response = BurpExtender.getCallbacks().makeHttpRequest(service, request);
+                long responseTime = System.currentTimeMillis() - startTime;
+
+                if (response == null || response.getResponse() == null) {
+                    recordFailure(hostKey);
+                    if (attempt < MAX_RETRIES - 1) {
+                        sleepRespectingInterrupts(calculateRetryDelay(attempt));
+                    }
+                    continue;
+                }
+
+                IResponseInfo responseInfo = BurpExtender.getHelpers().analyzeResponse(response.getResponse());
+                Map<String, Object> details = new HashMap<>();
+                details.put("statusCode", (int) responseInfo.getStatusCode());
+                details.put("headers", responseInfo.getHeaders());
+                details.put("responseTime", responseTime);
+
+                byte[] responseBody = java.util.Arrays.copyOfRange(
+                        response.getResponse(),
+                        responseInfo.getBodyOffset(),
+                        response.getResponse().length);
+                details.put("body", responseBody);
+
+                if (responseInfo.getStatusCode() >= 200 && responseInfo.getStatusCode() < 500) {
+                    recordSuccess(hostKey, responseTime);
+                } else {
+                    recordFailure(hostKey);
+                }
+
+                return details;
+            } catch (Exception e) {
+                recordFailure(hostKey);
+                if (attempt < MAX_RETRIES - 1) {
+                    sleepRespectingInterrupts(calculateRetryDelay(attempt));
+                }
+            }
+        }
+
+        return null;
+    }
+
     private static Map<String, Object> retrieveResponseDetails(IHttpService service, byte[] request, int retryCount) {
         String hostKey = service.getHost();
         String cacheKey = buildServiceCacheKey(service, request);
@@ -580,32 +649,30 @@ class RequestSender {
     
     private static boolean checkRateLimit(String hostKey) {
         AtomicInteger count = REQUEST_COUNTS.computeIfAbsent(hostKey, k -> new AtomicInteger(0));
-        AtomicLong lastTime = RATE_LIMIT_TIMESTAMPS.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis()));
+        AtomicLong windowStart = RATE_LIMIT_TIMESTAMPS.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis()));
 
         long currentTime = System.currentTimeMillis();
-        long timeDiff = currentTime - lastTime.get();
+        long windowStartTime = windowStart.get();
 
-        if (timeDiff >= 1000) {
-            count.set(0);
+        if (currentTime - windowStartTime >= 1000) {
+            // Atomically reset the window: CAS ensures only one thread resets
+            if (windowStart.compareAndSet(windowStartTime, currentTime)) {
+                count.set(0);
+            }
         }
 
-        if (count.get() >= getMaxRequestsPerSecond()) {
+        // Atomically check-and-increment
+        int current = count.get();
+        if (current >= getMaxRequestsPerSecond()) {
             return false;
         }
-
+        // incrementAndGet may briefly exceed limit under contention, but that's acceptable
         count.incrementAndGet();
-        lastTime.set(currentTime);
         return true;
     }
 
     private static long calculateAdaptiveDelay(String hostKey) {
-        // Start with base delay, adjust based on response times
-        AtomicLong lastTime = RATE_LIMIT_TIMESTAMPS.get(hostKey);
-        if (lastTime == null) {
-            return 50; // Base delay
-        }
-        // Could be enhanced to track average response times
-        return 50;
+        return PerformanceConfig.getDelayMs();
     }
     
     private static int calculateRetryDelay(int retryCount) {
@@ -623,8 +690,15 @@ class RequestSender {
         LAST_FAILURE_TIME.computeIfAbsent(hostKey, k -> new AtomicLong(System.currentTimeMillis())).set(System.currentTimeMillis());
     }
 
+    private static final int MAX_RATE_LIMIT_WAIT_MS = 5000;
+
     private static void waitForRateLimit(String hostKey) {
+        long deadline = System.currentTimeMillis() + MAX_RATE_LIMIT_WAIT_MS;
         while (!checkRateLimit(hostKey)) {
+            if (System.currentTimeMillis() >= deadline) {
+                BurpExtender.logDebug("Rate limit wait exceeded for " + hostKey + ", proceeding");
+                break;
+            }
             sleepRespectingInterrupts(100);
         }
     }
@@ -708,17 +782,36 @@ class RequestSender {
         String cleanedFirst = cleanResponseBody(firstString);
         String cleanedSecond = cleanResponseBody(secondString);
 
-        double jaroDist = JARO_WINKLER.apply(cleanedFirst, cleanedSecond);
-        int levenDist = LEVENSHTEIN.apply(cleanedFirst, cleanedSecond);
+        // Early termination: if body sizes differ drastically, they're not similar
+        if (cleanedFirst.isEmpty() && cleanedSecond.isEmpty()) {
+            results.put("similar", true);
+            results.put("jaro", 1.0);
+            results.put("levenshtein", 0);
+            return results;
+        }
+        int maxLen = Math.max(cleanedFirst.length(), cleanedSecond.length());
+        int sizeDiff = Math.abs(cleanedFirst.length() - cleanedSecond.length());
+        if (maxLen > 0 && sizeDiff > maxLen / 2) {
+            results.put("similar", false);
+            results.put("jaro", 0.0);
+            results.put("levenshtein", sizeDiff);
+            return results;
+        }
 
-        // Fixed similarity logic: Both metrics must indicate similarity for a positive match
-        // JaroWinklerSimilarity returns 0-1 (higher is better)
-        // LevenshteinDistance returns edit distance (lower is better)
+        // Cap body size to avoid O(n*m) explosion on large responses
+        String cappedFirst = cleanedFirst.length() > MAX_BODY_SIZE_FOR_COMPARISON
+                ? cleanedFirst.substring(0, MAX_BODY_SIZE_FOR_COMPARISON) : cleanedFirst;
+        String cappedSecond = cleanedSecond.length() > MAX_BODY_SIZE_FOR_COMPARISON
+                ? cleanedSecond.substring(0, MAX_BODY_SIZE_FOR_COMPARISON) : cleanedSecond;
+
+        double jaroDist = JARO_WINKLER.apply(cappedFirst, cappedSecond);
+        // LevenshteinDistance with threshold returns -1 if distance exceeds the threshold
+        int levenDist = LEVENSHTEIN.apply(cappedFirst, cappedSecond);
+
         boolean jaroSimilar = jaroDist >= JARO_THRESHOLD;
-        boolean levenSimilar = levenDist <= LEVENSHTEIN_THRESHOLD;
-        
-        // Require BOTH metrics to indicate similarity to reduce false positives
-        // This prevents cases where very different content has coincidentally low edit distance
+        // -1 means exceeded threshold → not similar
+        boolean levenSimilar = levenDist >= 0 && levenDist <= LEVENSHTEIN_THRESHOLD;
+
         boolean similar = jaroSimilar && levenSimilar;
 
         results.put("similar", similar);
@@ -727,10 +820,9 @@ class RequestSender {
         return results;
     }
 
-    // Helper method to generate a random alphanumeric string
     protected static String generateRandomString(int length) {
         String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        Random random = new Random();
+        ThreadLocalRandom random = ThreadLocalRandom.current();
         StringBuilder sb = new StringBuilder(length);
         for (int i = 0; i < length; i++) {
             sb.append(chars.charAt(random.nextInt(chars.length())));
@@ -775,9 +867,8 @@ class RequestSender {
             return false;
         }
 
-        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
-        byte[] requestBytes2 = requestBytes1;
-        Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
+        sleepRespectingInterrupts(PerformanceConfig.getDelayMs());
+        Map<String, Object> details2 = retrieveResponseDetailsNoCache(message.getHttpService(), requestBytes1);
         if (details2 == null) {
             return false;
         }
@@ -885,9 +976,8 @@ class RequestSender {
 
         // --- Second Request --- 
         // Introduce a small delay - sometimes caches need a moment
-        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {} 
-        byte[] requestBytes2 = requestBytes1; // Re-use
-        Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
+        sleepRespectingInterrupts(PerformanceConfig.getDelayMs());
+        Map<String, Object> details2 = retrieveResponseDetailsNoCache(message.getHttpService(), requestBytes1);
         if (details2 == null) return false;
         int statusCode2 = (int) details2.get("statusCode");
         @SuppressWarnings("unchecked") List<String> headers2 = (List<String>) details2.get("headers");
@@ -943,8 +1033,8 @@ class RequestSender {
         }
         
         if (statusCode1 == 200) {
-            byte[] requestBytes2 = requestBytes1;
-            Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
+            sleepRespectingInterrupts(PerformanceConfig.getDelayMs());
+            Map<String, Object> details2 = retrieveResponseDetailsNoCache(message.getHttpService(), requestBytes1);
             
             if (details2 != null) {
                 @SuppressWarnings("unchecked")
@@ -1026,9 +1116,8 @@ class RequestSender {
             return false;
         }
 
-        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
-        byte[] requestBytes2 = requestBytes1;
-        Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
+        sleepRespectingInterrupts(PerformanceConfig.getDelayMs());
+        Map<String, Object> details2 = retrieveResponseDetailsNoCache(message.getHttpService(), requestBytes1);
         if (details2 == null) {
             return false;
         }
@@ -1142,9 +1231,8 @@ class RequestSender {
             return false;
         }
         
-        try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
-        byte[] requestBytes2 = requestBytes1;
-        Map<String, Object> details2 = retrieveResponseDetails(message.getHttpService(), requestBytes2);
+        sleepRespectingInterrupts(PerformanceConfig.getDelayMs());
+        Map<String, Object> details2 = retrieveResponseDetailsNoCache(message.getHttpService(), requestBytes1);
         if (details2 == null) {
             return false;
         }
@@ -1365,7 +1453,7 @@ class RequestSender {
      * Returns confidence level: "High", "Medium", or "Low".
      */
     protected static String multiRoundVerification(IHttpRequestResponse message, byte[] testRequest, int rounds) {
-        if (rounds < 2) rounds = 3; // Minimum 3 rounds
+        if (rounds < 3) rounds = 3;
         
         byte[] originalAuthRequest = buildHttpRequest(message, null, null, true);
         Map<String, Object> originalDetails = retrieveResponseDetails(message.getHttpService(), originalAuthRequest);
@@ -1376,9 +1464,9 @@ class RequestSender {
         int similarResponses = 0;
         
         for (int i = 0; i < rounds; i++) {
-            try { Thread.sleep(PerformanceConfig.getDelayMs()); } catch (InterruptedException ignored) {}
+            sleepRespectingInterrupts(PerformanceConfig.getDelayMs());
             
-            Map<String, Object> details = retrieveResponseDetails(message.getHttpService(), testRequest);
+            Map<String, Object> details = retrieveResponseDetailsNoCache(message.getHttpService(), testRequest);
             if (details == null) continue;
             
             @SuppressWarnings("unchecked")
@@ -1406,22 +1494,7 @@ class RequestSender {
         }
     }
     
-    /**
-     * Enhanced similarity test with early termination for large responses.
-     */
-    protected static Map<String, Object> testSimilarOptimized(String firstString, String secondString) {
-        // Early termination for very different sizes
-        int sizeDiff = Math.abs(firstString.length() - secondString.length());
-        if (sizeDiff > firstString.length() * 0.5) {
-            Map<String, Object> results = new HashMap<>();
-            results.put("similar", false);
-            results.put("jaro", 0.0);
-            results.put("levenshtein", Integer.MAX_VALUE);
-            return results;
-        }
 
-        return testSimilar(firstString, secondString);
-    }
 
     /**
      * Builds a request by cloning the original message and replacing the query string.
